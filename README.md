@@ -20,6 +20,27 @@ Manual compilation and loading:
 make && make load
 ```
 
+### NixOS
+
+If you are using NixOS with flakes, you can add the module directly to your `flake.nix`:
+
+```nix
+{
+  inputs.tcp-brutal.url = "github:apernet/tcp-brutal";
+  
+  outputs = { nixpkgs, tcp-brutal, ... }: {
+    nixosConfigurations.myHost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        # ... your configuration.nix ...
+        tcp-brutal.nixosModules.default
+        { boot.tcp-brutal.enable = true; }
+      ];
+    };
+  };
+}
+```
+
 > Kernel version 4.9 or later is required, version 5.8 or later is recommended. **If your kernel version is earlier than 5.8, only IPv4 is supported.** [(lack of exported symbol `tcpv6_prot`)](https://github.com/torvalds/linux/commit/6abde0b241224347cd88e2ae75902e07f55c42cb#diff-8b341e52e57c996bc4f294087ab526ac0b1c3c47e045557628cc24277cbfda0dR2124)
 >
 > **⚠️ Warning** For systems with kernel versions lower than 4.13, you MUST manually enable fq pacing (`tc qdisc add dev eth0 root fq pacing`), otherwise TCP Brutal will not work properly.

@@ -18,6 +18,27 @@ bash <(curl -fsSL https://tcp.hy2.sh/)
 make && make load
 ```
 
+### NixOS
+
+如果你正在使用带有 flakes 功能的 NixOS，你可以直接将此模块添加到你的 `flake.nix` 中：
+
+```nix
+{
+  inputs.tcp-brutal.url = "github:apernet/tcp-brutal";
+  
+  outputs = { nixpkgs, tcp-brutal, ... }: {
+    nixosConfigurations.myHost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        # ... 你的 configuration.nix ...
+        tcp-brutal.nixosModules.default
+        { boot.tcp-brutal.enable = true; }
+      ];
+    };
+  };
+}
+```
+
 > 需要内核版本 4.9 或以上，推荐使用 5.8 以上的内核。**对于小于 5.8 的内核, 只支持 IPv4。** [(缺导出符号 `tcpv6_prot`)](https://github.com/torvalds/linux/commit/6abde0b241224347cd88e2ae75902e07f55c42cb#diff-8b341e52e57c996bc4f294087ab526ac0b1c3c47e045557628cc24277cbfda0dR2124)
 >
 > **⚠️ 注意** 对于内核版本低于 4.13 的系统，必须手动开启 fq pacing (`tc qdisc add dev eth0 root fq pacing`) 否则 TCP Brutal 无法正常工作。
