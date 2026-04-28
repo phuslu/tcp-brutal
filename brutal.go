@@ -63,7 +63,14 @@ const (
 	bpfSrcX       = 0x08
 
 	bpfCoreFieldByteOffset = 0
-	btfMagic               = 0xeb9f
+	bpfCoreFieldByteSize   = 1
+	bpfCoreFieldSigned     = 3
+	bpfCoreFieldLShiftU64  = 4
+	bpfCoreFieldRShiftU64  = 5
+
+	btfMagic     = 0xeb9f
+	btfKindFlag  = uint32(1 << 31)
+	btfIntSigned = 1
 )
 
 const (
@@ -858,68 +865,157 @@ func (p *programSpec) applyCoreRelocs(insns []byte, localBTF, targetBTF *btfSpec
 		return errors.New("missing local or target BTF")
 	}
 	for _, rel := range p.coreRelocs {
-		if rel.kind != bpfCoreFieldByteOffset {
+		if !isSupportedFieldCoreReloc(rel.kind) {
 			return fmt.Errorf("unsupported CO-RE relocation kind %d at instruction offset %#x", rel.kind, rel.insnOffset)
 		}
-		value, err := resolveCoreFieldByteOffset(localBTF, targetBTF, rel.typeID, rel.access)
+		value, err := resolveCoreFieldReloc(localBTF, targetBTF, rel.typeID, rel.access, rel.kind, order)
 		if err != nil {
 			return fmt.Errorf("resolve %q at instruction offset %#x: %w", rel.access, rel.insnOffset, err)
 		}
-		if err := patchCoreFieldByteOffset(insns, rel.insnOffset, value, order); err != nil {
+		if err := patchCoreFieldReloc(insns, rel.insnOffset, value, order); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func resolveCoreFieldByteOffset(localBTF, targetBTF *btfSpec, typeID uint32, access string) (uint32, error) {
-	accessors, err := parseCoreAccess(access)
+func isSupportedFieldCoreReloc(kind uint32) bool {
+	switch kind {
+	case bpfCoreFieldByteOffset, bpfCoreFieldByteSize, bpfCoreFieldSigned,
+		bpfCoreFieldLShiftU64, bpfCoreFieldRShiftU64:
+		return true
+	default:
+		return false
+	}
+}
+
+type coreField struct {
+	typeID         uint32
+	bitOffset      uint32
+	bitfieldOffset uint32
+	bitfieldSize   uint32
+}
+
+func resolveCoreFieldReloc(localBTF, targetBTF *btfSpec, typeID uint32, access string, kind uint32, order binary.ByteOrder) (uint32, error) {
+	field, err := resolveCoreField(localBTF, targetBTF, typeID, access)
 	if err != nil {
 		return 0, err
 	}
+
+	switch kind {
+	case bpfCoreFieldByteOffset:
+		if field.bitfieldSize > 0 {
+			offset, err := targetBTF.coreBitfieldByteOffset(field)
+			if err != nil {
+				return 0, err
+			}
+			return offset, nil
+		}
+		if field.bitOffset%8 != 0 {
+			return 0, fmt.Errorf("resolved bit offset %d is not byte aligned", field.bitOffset)
+		}
+		return field.bitOffset / 8, nil
+
+	case bpfCoreFieldByteSize:
+		size, err := targetBTF.sizeof(field.typeID)
+		if err != nil {
+			return 0, err
+		}
+		return size, nil
+
+	case bpfCoreFieldSigned:
+		return targetBTF.coreFieldSigned(field.typeID)
+
+	case bpfCoreFieldLShiftU64:
+		size, err := targetBTF.coreFieldBitSize(field)
+		if err != nil {
+			return 0, err
+		}
+		if order == binary.LittleEndian {
+			if field.bitfieldOffset+size > 64 {
+				return 0, fmt.Errorf("bitfield exceeds u64 extraction width: offset %d size %d", field.bitfieldOffset, size)
+			}
+			return 64 - field.bitfieldOffset - size, nil
+		}
+		loadSize, err := targetBTF.sizeof(field.typeID)
+		if err != nil {
+			return 0, err
+		}
+		loadBits := loadSize * 8
+		if loadBits > 64 || field.bitfieldOffset > loadBits {
+			return 0, fmt.Errorf("invalid big-endian bitfield extraction: offset %d load bits %d", field.bitfieldOffset, loadBits)
+		}
+		return 64 - loadBits + field.bitfieldOffset, nil
+
+	case bpfCoreFieldRShiftU64:
+		size, err := targetBTF.coreFieldBitSize(field)
+		if err != nil {
+			return 0, err
+		}
+		if size > 64 {
+			return 0, fmt.Errorf("field bit size %d exceeds u64 extraction width", size)
+		}
+		return 64 - size, nil
+
+	default:
+		return 0, fmt.Errorf("unsupported CO-RE relocation kind %d", kind)
+	}
+}
+
+func resolveCoreField(localBTF, targetBTF *btfSpec, typeID uint32, access string) (coreField, error) {
+	accessors, err := parseCoreAccess(access)
+	if err != nil {
+		return coreField{}, err
+	}
 	if len(accessors) == 0 || accessors[0] != 0 {
-		return 0, fmt.Errorf("unsupported access path %q", access)
+		return coreField{}, fmt.Errorf("unsupported access path %q", access)
 	}
 
 	localType := localBTF.resolveType(typeID)
 	if localType == nil {
-		return 0, fmt.Errorf("local BTF type id %d not found", typeID)
+		return coreField{}, fmt.Errorf("local BTF type id %d not found", typeID)
 	}
 	targetType := targetBTF.find(localType.kind, localType.name)
 	if targetType == nil {
-		return 0, fmt.Errorf("target BTF is missing %s %q", btfKindName(localType.kind), localType.name)
+		return coreField{}, fmt.Errorf("target BTF is missing %s %q", btfKindName(localType.kind), localType.name)
 	}
 
-	var bitOffset uint32
+	field := coreField{typeID: targetType.id}
 	for _, index := range accessors[1:] {
 		localType = localBTF.resolveType(localType.id)
 		targetType = targetBTF.resolveType(targetType.id)
 		if localType == nil || targetType == nil {
-			return 0, errors.New("invalid BTF type while resolving access path")
+			return coreField{}, errors.New("invalid BTF type while resolving access path")
 		}
 		if localType.kind != btfKindStruct && localType.kind != btfKindUnion {
-			return 0, fmt.Errorf("local type %q is not a struct or union", localType.name)
+			return coreField{}, fmt.Errorf("local type %q is not a struct or union", localType.name)
 		}
 		if targetType.kind != btfKindStruct && targetType.kind != btfKindUnion {
-			return 0, fmt.Errorf("target type %q is not a struct or union", targetType.name)
+			return coreField{}, fmt.Errorf("target type %q is not a struct or union", targetType.name)
 		}
 		if index >= uint32(len(localType.members)) {
-			return 0, fmt.Errorf("member index %d is outside local type %q", index, localType.name)
+			return coreField{}, fmt.Errorf("member index %d is outside local type %q", index, localType.name)
 		}
 
 		localMember := localType.members[index]
 		targetMember := targetType.matchCoreMember(localMember.name, index)
 		if targetMember == nil {
-			return 0, fmt.Errorf("target type %q is missing member %q", targetType.name, localMember.name)
+			return coreField{}, fmt.Errorf("target type %q is missing member %q", targetType.name, localMember.name)
 		}
-		bitOffset += targetMember.bitOffset
+		field.bitOffset += targetMember.bitOffset
+		field.typeID = targetMember.typeID
+		field.bitfieldSize = targetMember.bitfieldSize
+		field.bitfieldOffset = 0
 		localType = localBTF.resolveType(localMember.typeID)
 		targetType = targetBTF.resolveType(targetMember.typeID)
 	}
-	if bitOffset%8 != 0 {
-		return 0, fmt.Errorf("resolved bit offset %d is not byte aligned", bitOffset)
+
+	if field.bitfieldSize > 0 {
+		if err := targetBTF.adjustCoreBitfield(&field); err != nil {
+			return coreField{}, err
+		}
 	}
-	return bitOffset / 8, nil
+	return field, nil
 }
 
 func parseCoreAccess(access string) ([]uint32, error) {
@@ -938,7 +1034,7 @@ func parseCoreAccess(access string) ([]uint32, error) {
 	return accessors, nil
 }
 
-func patchCoreFieldByteOffset(insns []byte, offset uint32, value uint32, order binary.ByteOrder) error {
+func patchCoreFieldReloc(insns []byte, offset uint32, value uint32, order binary.ByteOrder) error {
 	if offset%8 != 0 {
 		return fmt.Errorf("CO-RE relocation offset %#x is not instruction aligned", offset)
 	}
@@ -1481,20 +1577,22 @@ type btfSpec struct {
 }
 
 type btfType struct {
-	id         uint32
-	name       string
-	kind       uint32
-	size       uint32
-	typeID     uint32
-	members    []btfMember
-	paramCount uint32
-	varType    uint32
+	id          uint32
+	name        string
+	kind        uint32
+	size        uint32
+	typeID      uint32
+	intEncoding uint32
+	members     []btfMember
+	paramCount  uint32
+	varType     uint32
 }
 
 type btfMember struct {
-	name      string
-	typeID    uint32
-	bitOffset uint32
+	name         string
+	typeID       uint32
+	bitOffset    uint32
+	bitfieldSize uint32
 }
 
 type btfHeader struct {
@@ -1552,6 +1650,7 @@ func parseBTF(data []byte) (*btfSpec, error) {
 		off += 12
 
 		kind := (info >> 24) & 0x1f
+		kindFlag := info&btfKindFlag != 0
 		vlen := info & 0xffff
 		t := &btfType{
 			id:     id,
@@ -1563,6 +1662,10 @@ func parseBTF(data []byte) (*btfSpec, error) {
 
 		switch kind {
 		case btfKindInt:
+			if off+4 > uint32(len(types)) {
+				return nil, fmt.Errorf("truncated BTF int info for %s", t.name)
+			}
+			t.intEncoding = (order.Uint32(types[off:off+4]) >> 24) & 0x0f
 			off += 4
 		case btfKindPtr, btfKindFwd, btfKindTypedef, btfKindVolatile, btfKindConst, btfKindRestrict, btfKindFunc, btfKindFloat, btfKindTypeTag:
 		case btfKindArray:
@@ -1573,10 +1676,18 @@ func parseBTF(data []byte) (*btfSpec, error) {
 				if off+12 > uint32(len(types)) {
 					return nil, fmt.Errorf("truncated BTF members for %s", t.name)
 				}
+				rawOffset := order.Uint32(types[off+8 : off+12])
+				bitOffset := rawOffset
+				var bitfieldSize uint32
+				if kindFlag {
+					bitOffset = rawOffset & 0x00ffffff
+					bitfieldSize = rawOffset >> 24
+				}
 				t.members = append(t.members, btfMember{
-					name:      spec.string(order.Uint32(types[off : off+4])),
-					typeID:    order.Uint32(types[off+4 : off+8]),
-					bitOffset: order.Uint32(types[off+8:off+12]) & 0x00ffffff,
+					name:         spec.string(order.Uint32(types[off : off+4])),
+					typeID:       order.Uint32(types[off+4 : off+8]),
+					bitOffset:    bitOffset,
+					bitfieldSize: bitfieldSize,
 				})
 				off += 12
 			}
@@ -1686,6 +1797,76 @@ func (s *btfSpec) sizeof(typeID uint32) (uint32, error) {
 		return s.sizeof(typ.typeID)
 	default:
 		return 0, fmt.Errorf("unsupported sizeof kind %d for %s", typ.kind, typ.name)
+	}
+}
+
+func (s *btfSpec) adjustCoreBitfield(field *coreField) error {
+	offset, err := s.coreBitfieldByteOffset(*field)
+	if err != nil {
+		return err
+	}
+	field.bitfieldOffset = field.bitOffset - offset*8
+	return nil
+}
+
+func (s *btfSpec) coreBitfieldByteOffset(field coreField) (uint32, error) {
+	align, err := s.alignof(field.typeID)
+	if err != nil {
+		return 0, err
+	}
+	if align == 0 {
+		return 0, errors.New("zero field alignment")
+	}
+	return (field.bitOffset / 8 / align) * align, nil
+}
+
+func (s *btfSpec) coreFieldBitSize(field coreField) (uint32, error) {
+	if field.bitfieldSize > 0 {
+		return field.bitfieldSize, nil
+	}
+	size, err := s.sizeof(field.typeID)
+	if err != nil {
+		return 0, err
+	}
+	return size * 8, nil
+}
+
+func (s *btfSpec) coreFieldSigned(typeID uint32) (uint32, error) {
+	typ := s.resolveType(typeID)
+	if typ == nil {
+		return 0, fmt.Errorf("invalid type id %d", typeID)
+	}
+	if typ.kind != btfKindInt {
+		return 0, fmt.Errorf("type %q has no integer signedness", typ.name)
+	}
+	if typ.intEncoding&btfIntSigned != 0 {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+func (s *btfSpec) alignof(typeID uint32) (uint32, error) {
+	typ := s.resolveType(typeID)
+	if typ == nil {
+		return 0, fmt.Errorf("invalid type id %d", typeID)
+	}
+	switch typ.kind {
+	case btfKindInt, btfKindEnum, btfKindPtr:
+		return s.sizeof(typ.id)
+	case btfKindStruct, btfKindUnion:
+		var align uint32 = 1
+		for _, member := range typ.members {
+			memberAlign, err := s.alignof(member.typeID)
+			if err != nil {
+				return 0, err
+			}
+			if memberAlign > align {
+				align = memberAlign
+			}
+		}
+		return align, nil
+	default:
+		return 0, fmt.Errorf("unsupported alignof kind %d for %s", typ.kind, typ.name)
 	}
 }
 
