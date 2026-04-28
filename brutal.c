@@ -285,6 +285,7 @@ int brutal_setsockopt(struct bpf_sockopt *ctx)
 SEC("struct_ops")
 void BPF_PROG(brutal_init, struct sock *sk)
 {
+    struct tcp_sock *tp = brutal_tcp_sk(sk);
     struct brutal *brutal = brutal_ca(sk);
     struct brutal_param_storage *params;
 
@@ -298,6 +299,19 @@ void BPF_PROG(brutal_init, struct sock *sk)
 
     if (sk->sk_pacing_status == SK_PACING_NONE)
         sk->sk_pacing_status = SK_PACING_NEEDED;
+
+    /* Prefill pacing rate and cwnd to skip the first-RTT slow-start penalty.
+     * Only effective when init runs after srtt is established (typically the
+     * passive accept path: tcp_init_transfer -> brutal_init, srtt already set
+     * by the 3-way handshake). On the active connect path srtt is still 0 here
+     * and we fall through to the normal first-ACK update. */
+    if (tp->srtt_us > 0) {
+        __u64 rate = brutal_effective_rate(sk, brutal->rate);
+        __u32 target = brutal_target_cwnd(sk, rate);
+        sk->sk_pacing_rate = rate;
+        if (target > tp->snd_cwnd)
+            brutal_tcp_snd_cwnd_set(tp, target);
+    }
 }
 
 SEC("struct_ops")
