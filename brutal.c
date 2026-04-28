@@ -3,6 +3,7 @@
 #include "vmlinux.h"
 #include <linux/version.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 
 #ifndef __VMLINUX_H__
@@ -30,7 +31,6 @@ struct brutal_params {
 
 #define TCP_CA_NAME_MAX 16
 #define TCP_CONG_NON_RESTRICTED (1U << 0)
-#define TCP_INFINITE_SSTHRESH 0x7fffffffU
 #define MIN_PKT_INFO_SAMPLES 50U
 #define MIN_ACK_RATE_PERCENT 80U
 
@@ -174,6 +174,34 @@ static __always_inline struct brutal_pkt_info *brutal_get_slot(struct brutal *br
     }
 }
 
+static __always_inline __u64 brutal_effective_rate(const struct sock *sk, __u64 rate)
+{
+    return brutal_min_u64(rate, sk->sk_max_pacing_rate);
+}
+
+static __always_inline __u32 brutal_target_cwnd(const struct sock *sk, __u64 rate)
+{
+    const struct tcp_sock *tp = brutal_tcp_sk(sk);
+    const struct brutal *brutal = brutal_ca(sk);
+    __u32 mss = tp->mss_cache ? tp->mss_cache : 1;
+    __u32 rtt_ms = (tp->srtt_us >> 3) / USEC_PER_MSEC;
+    __u32 gain = brutal->cwnd_gain ? brutal->cwnd_gain : INIT_CWND_GAIN;
+    __u64 cwnd;
+
+    if (!rtt_ms)
+        rtt_ms = 1;
+
+    cwnd = rate / MSEC_PER_SEC;
+    cwnd *= rtt_ms;
+    cwnd /= mss;
+    cwnd *= gain;
+    cwnd /= 10;
+    if (cwnd < MIN_CWND)
+        cwnd = MIN_CWND;
+
+    return (__u32)brutal_min_u64(cwnd, tp->snd_cwnd_clamp);
+}
+
 static __always_inline void brutal_update_rate(struct sock *sk, struct brutal *brutal,
                                                __u64 sec)
 {
@@ -183,14 +211,8 @@ static __always_inline void brutal_update_rate(struct sock *sk, struct brutal *b
     __u32 losses = 0;
     __u32 ack_rate;
     __u64 rate = brutal->rate;
-    __u64 cwnd;
-    __u32 mss = tp->mss_cache;
-    __u32 rtt_ms = (tp->srtt_us >> 3) / USEC_PER_MSEC;
-
-    if (!mss)
-        mss = 1;
-    if (!rtt_ms)
-        rtt_ms = 1;
+    __u64 effective_rate;
+    __u8 ca_state;
 
     if (sec > BRUTAL_PKT_INFO_SLOTS - 1)
         min_sec = sec - (BRUTAL_PKT_INFO_SLOTS - 1);
@@ -213,18 +235,14 @@ static __always_inline void brutal_update_rate(struct sock *sk, struct brutal *b
 
     rate = rate * 100 / ack_rate;
 
-    cwnd = rate / MSEC_PER_SEC;
-    cwnd *= rtt_ms;
-    cwnd /= mss;
-    cwnd *= brutal->cwnd_gain;
-    cwnd /= 10;
-    if (cwnd < MIN_CWND)
-        cwnd = MIN_CWND;
+    ca_state = BPF_CORE_READ_BITFIELD_PROBED((struct inet_connection_sock *)sk, icsk_ca_state);
+    if (ca_state >= TCP_CA_Recovery)
+        rate = rate * 3 / 4;
 
-    cwnd = brutal_min_u64(cwnd, tp->snd_cwnd_clamp);
+    effective_rate = brutal_effective_rate(sk, rate);
 
-    brutal_tcp_snd_cwnd_set(tp, (__u32)cwnd);
-    sk->sk_pacing_rate = brutal_min_u64(rate, sk->sk_max_pacing_rate);
+    brutal_tcp_snd_cwnd_set(tp, brutal_target_cwnd(sk, effective_rate));
+    sk->sk_pacing_rate = effective_rate;
 }
 
 SEC("cgroup/setsockopt")
@@ -267,7 +285,6 @@ int brutal_setsockopt(struct bpf_sockopt *ctx)
 SEC("struct_ops")
 void BPF_PROG(brutal_init, struct sock *sk)
 {
-    struct tcp_sock *tp = brutal_tcp_sk(sk);
     struct brutal *brutal = brutal_ca(sk);
     struct brutal_param_storage *params;
 
@@ -278,8 +295,6 @@ void BPF_PROG(brutal_init, struct sock *sk)
         brutal_valid_params(params->rate, params->cwnd_gain))
         brutal_apply_params(brutal, params->rate, params->cwnd_gain,
                             params->generation);
-
-    tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 
     if (sk->sk_pacing_status == SK_PACING_NONE)
         sk->sk_pacing_status = SK_PACING_NEEDED;
@@ -305,13 +320,16 @@ void BPF_PROG(brutal_cong_control, struct sock *sk, __u32 ack, int flag,
         slot = sec % BRUTAL_PKT_INFO_SLOTS;
         slot_info = brutal_get_slot(brutal, slot);
 
+        __u32 acked = rs->acked_sacked > 0 ? (__u32)rs->acked_sacked : 0;
+        __u32 losses = rs->losses > 0 ? (__u32)rs->losses : 0;
+
         if (slot_info->sec == sec) {
-            slot_info->acked += rs->acked_sacked;
-            slot_info->losses += rs->losses;
+            slot_info->acked += acked;
+            slot_info->losses += losses;
         } else {
             slot_info->sec = sec;
-            slot_info->acked = rs->acked_sacked;
-            slot_info->losses = rs->losses;
+            slot_info->acked = acked;
+            slot_info->losses = losses;
         }
     }
 
@@ -321,13 +339,22 @@ void BPF_PROG(brutal_cong_control, struct sock *sk, __u32 ack, int flag,
 SEC("struct_ops")
 __u32 BPF_PROG(brutal_undo_cwnd, struct sock *sk)
 {
-    return brutal_tcp_sk(sk)->snd_cwnd;
+    struct tcp_sock *tp = brutal_tcp_sk(sk);
+    struct brutal *brutal = brutal_ca(sk);
+
+    /* Use raw rate (no ack_rate boost, no recovery halving) — undo recovers
+     * cwnd to the steady-state target as if the spurious event hadn't happened. */
+    __u32 target = brutal_target_cwnd(sk, brutal_effective_rate(sk, brutal->rate));
+
+    return target > tp->snd_cwnd ? target : tp->snd_cwnd;
 }
 
 SEC("struct_ops")
 __u32 BPF_PROG(brutal_ssthresh, struct sock *sk)
 {
-    return brutal_tcp_sk(sk)->snd_ssthresh;
+    struct brutal *brutal = brutal_ca(sk);
+
+    return brutal_target_cwnd(sk, brutal_effective_rate(sk, brutal->rate));
 }
 
 SEC("struct_ops")
