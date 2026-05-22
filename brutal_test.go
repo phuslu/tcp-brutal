@@ -5,16 +5,34 @@ package brutal
 import "testing"
 
 func TestBPFObjectName(t *testing.T) {
-	if got := bpfObjectName(false); got != "brutal_linux_bpfel.o" {
-		t.Fatalf("little-endian object = %q", got)
+	tests := []struct {
+		name      string
+		bigEndian bool
+		legacy    bool
+		want      string
+	}{
+		{name: "little", want: "brutal_linux_bpfel.o"},
+		{name: "big", bigEndian: true, want: "brutal_linux_bpfeb.o"},
+		{name: "legacy little", legacy: true, want: "brutal_legacy_linux_bpfel.o"},
+		{name: "legacy big", bigEndian: true, legacy: true, want: "brutal_legacy_linux_bpfeb.o"},
 	}
-	if got := bpfObjectName(true); got != "brutal_linux_bpfeb.o" {
-		t.Fatalf("big-endian object = %q", got)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := bpfObjectName(tt.bigEndian, tt.legacy); got != tt.want {
+				t.Fatalf("object name = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
 func TestCoreRelocationsApplyAgainstLocalBTF(t *testing.T) {
-	for _, name := range []string{"brutal_linux_bpfel.o", "brutal_linux_bpfeb.o"} {
+	for _, name := range []string{
+		"brutal_linux_bpfel.o",
+		"brutal_linux_bpfeb.o",
+		"brutal_legacy_linux_bpfel.o",
+		"brutal_legacy_linux_bpfeb.o",
+	} {
 		t.Run(name, func(t *testing.T) {
 			data, err := bpfObjects.ReadFile(name)
 			if err != nil {

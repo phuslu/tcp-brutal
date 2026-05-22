@@ -4,11 +4,11 @@
 
 ## Requirements
 
-- Linux 6.10 or newer with kernel BTF at `/sys/kernel/btf/vmlinux`
+- Linux 6.0 or newer with kernel BTF at `/sys/kernel/btf/vmlinux`
 - BPF `struct_ops` TCP congestion control support
 - cgroup v2 mounted at `/sys/fs/cgroup`
 - socket local storage and cgroup sockopt hook support
-- `clang`, `bpftool`, Linux 6.10+ kernel headers and Go
+- `clang`, `bpftool`, Linux kernel headers and Go
 
 ## Build
 
@@ -28,7 +28,7 @@ clang -g -O2 -Wall -Werror -Wno-missing-declarations -target bpfel \
 go build -trimpath -o brutal ./cmd/brutal
 ```
 
-Use `-target bpfeb` and output `brutal_linux_bpfeb.o` instead when building for a big-endian Linux target. The Go package loads `brutal_linux_bpfel.o` or `brutal_linux_bpfeb.o` according to the host byte order. The matching object must exist before building any package or binary that imports `github.com/phuslu/tcp-brutal`; build it against kernel BTF that contains the TCP structures and callbacks used by `brutal.c`. The loader applies CO-RE field relocations against the target kernel BTF at runtime.
+Build the legacy Linux 6.0-6.9 object by adding `-DBRUTAL_LEGACY_TCP_CC` and writing `brutal_legacy_linux_bpfel.o`. Use `-target bpfeb` and the corresponding `*_bpfeb.o` output names when building for a big-endian Linux target. The Go package selects the current or legacy object according to the running kernel BTF and host byte order. The matching object must exist before building any package or binary that imports `github.com/phuslu/tcp-brutal`; build it against kernel BTF that contains the TCP structures and callbacks used by `brutal.c`. The loader applies CO-RE field relocations against the target kernel BTF at runtime.
 
 ## Package API
 

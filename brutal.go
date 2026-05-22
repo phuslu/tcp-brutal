@@ -24,10 +24,12 @@ const (
 
 	tcpAvailableCongestionControl = "/proc/sys/net/ipv4/tcp_available_congestion_control"
 
-	bpfObjectLittleEndianName = "brutal_linux_bpfel.o"
-	bpfObjectBigEndianName    = "brutal_linux_bpfeb.o"
-	structOpsPinPath          = defaultPinRoot + "/brutal_cc"
-	setsockoptPinPath         = defaultPinRoot + "/brutal_setsockopt"
+	bpfObjectLittleEndianName       = "brutal_linux_bpfel.o"
+	bpfObjectBigEndianName          = "brutal_linux_bpfeb.o"
+	bpfObjectLegacyLittleEndianName = "brutal_legacy_linux_bpfel.o"
+	bpfObjectLegacyBigEndianName    = "brutal_legacy_linux_bpfeb.o"
+	structOpsPinPath                = defaultPinRoot + "/brutal_cc"
+	setsockoptPinPath               = defaultPinRoot + "/brutal_setsockopt"
 )
 
 const (
@@ -349,16 +351,6 @@ func (opts Options) withDefaults() Options {
 }
 
 func loadBPF(opts Options) (_ *loadedBPF, err error) {
-	objBytes, objName, err := selectObject()
-	if err != nil {
-		return nil, err
-	}
-
-	obj, err := parseBPFObject(objBytes, objName)
-	if err != nil {
-		return nil, err
-	}
-
 	kernelBTF, err := loadKernelBTF()
 	if err != nil {
 		return nil, err
@@ -368,7 +360,18 @@ func loadBPF(opts Options) (_ *loadedBPF, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := kernelBTF.requireTCP610(opsInfo); err != nil {
+	congControlParams, err := kernelBTF.tcpCongControlParamCount(opsInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	objBytes, objName, err := selectObject(congControlParams)
+	if err != nil {
+		return nil, err
+	}
+
+	obj, err := parseBPFObject(objBytes, objName)
+	if err != nil {
 		return nil, err
 	}
 
@@ -438,8 +441,19 @@ func (l *loadedBPF) close() {
 	l.fds = nil
 }
 
-func selectObject() ([]byte, string, error) {
-	name := bpfObjectName(nativeEndianIsBig())
+func selectObject(congControlParamCount int) ([]byte, string, error) {
+	var legacy bool
+	switch congControlParamCount {
+	case 2:
+		legacy = true
+	case 4:
+	case 0:
+		return nil, "", errors.New("kernel tcp_congestion_ops.cong_control has no parameters")
+	default:
+		return nil, "", fmt.Errorf("kernel tcp_congestion_ops.cong_control has %d parameters; Linux 6.0 or newer with a supported tcp_congestion_ops ABI is required", congControlParamCount)
+	}
+
+	name := bpfObjectName(nativeEndianIsBig(), legacy)
 	data, err := bpfObjects.ReadFile(name)
 	if err == nil {
 		return data, name, nil
@@ -452,7 +466,13 @@ func selectObject() ([]byte, string, error) {
 	return nil, "", fmt.Errorf("embedded BPF object %s not found; available objects: %s", name, strings.Join(available, ", "))
 }
 
-func bpfObjectName(bigEndian bool) string {
+func bpfObjectName(bigEndian, legacy bool) string {
+	if legacy {
+		if bigEndian {
+			return bpfObjectLegacyBigEndianName
+		}
+		return bpfObjectLegacyLittleEndianName
+	}
 	if bigEndian {
 		return bpfObjectBigEndianName
 	}
@@ -1903,19 +1923,16 @@ func (s *btfSpec) structOpsInfo(innerName string) (*structOpsInfo, error) {
 	return info, nil
 }
 
-func (s *btfSpec) requireTCP610(ops *structOpsInfo) error {
+func (s *btfSpec) tcpCongControlParamCount(ops *structOpsInfo) (int, error) {
 	member, ok := ops.members["cong_control"]
 	if !ok {
-		return errors.New("kernel tcp_congestion_ops is missing member cong_control")
+		return 0, errors.New("kernel tcp_congestion_ops is missing member cong_control")
 	}
 	proto := s.funcProto(member.typeID)
 	if proto == nil {
-		return errors.New("kernel tcp_congestion_ops.cong_control is not a function pointer")
+		return 0, errors.New("kernel tcp_congestion_ops.cong_control is not a function pointer")
 	}
-	if proto.paramCount != 4 {
-		return fmt.Errorf("kernel tcp_congestion_ops.cong_control has %d parameters; Linux 6.10 or newer is required", proto.paramCount)
-	}
-	return nil
+	return int(proto.paramCount), nil
 }
 
 func (s *btfSpec) funcProto(typeID uint32) *btfType {

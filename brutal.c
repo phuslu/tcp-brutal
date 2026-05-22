@@ -34,8 +34,14 @@ struct brutal_params {
 #define MIN_PKT_INFO_SAMPLES 50U
 #define MIN_ACK_RATE_PERCENT 80U
 
+#ifdef BRUTAL_LEGACY_TCP_CC
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+#error "tcp-brutal legacy object requires Linux 6.0 or newer"
+#endif
+#else
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 #error "tcp-brutal requires Linux 6.10 or newer"
+#endif
 #endif
 
 #define BRUTAL_CA_PRIV_SIZE sizeof(((struct inet_connection_sock *)0)->icsk_ca_priv)
@@ -315,8 +321,13 @@ void BPF_PROG(brutal_init, struct sock *sk)
 }
 
 SEC("struct_ops")
+#ifdef BRUTAL_LEGACY_TCP_CC
+void BPF_PROG(brutal_cong_control, struct sock *sk,
+              const struct rate_sample *rs)
+#else
 void BPF_PROG(brutal_cong_control, struct sock *sk, __u32 ack, int flag,
               const struct rate_sample *rs)
+#endif
 {
     struct tcp_sock *tp = brutal_tcp_sk(sk);
     struct brutal *brutal = brutal_ca(sk);
@@ -324,8 +335,10 @@ void BPF_PROG(brutal_cong_control, struct sock *sk, __u32 ack, int flag,
     __u64 sec;
     __u64 slot;
 
+#ifndef BRUTAL_LEGACY_TCP_CC
     (void)ack;
     (void)flag;
+#endif
 
     sec = brutal_tcp_sock_get_sec(tp);
     brutal_try_apply_stored_params(sk, brutal, sec);
