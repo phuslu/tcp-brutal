@@ -4,7 +4,7 @@
 
 ## Requirements
 
-- Linux 6.0 or newer with kernel BTF at `/sys/kernel/btf/vmlinux`
+- Linux 6.10 or newer with kernel BTF at `/sys/kernel/btf/vmlinux`
 - BPF `struct_ops` TCP congestion control support
 - cgroup v2 mounted at `/sys/fs/cgroup`
 - socket local storage and cgroup sockopt hook support
@@ -28,7 +28,7 @@ clang -g -O2 -Wall -Werror -Wno-missing-declarations -target bpfel \
 go build -trimpath -o brutal ./cmd/brutal
 ```
 
-Build the legacy Linux 6.0-6.9 object by adding `-DBRUTAL_LEGACY_TCP_CC` and writing `brutal_legacy_linux_bpfel.o`. Use `-target bpfeb` and the corresponding `*_bpfeb.o` output names when building for a big-endian Linux target. The Go package selects the current or legacy object according to the running kernel BTF and host byte order. The matching object must exist before building any package or binary that imports `github.com/phuslu/tcp-brutal`; build it against kernel BTF that contains the TCP structures and callbacks used by `brutal.c`. The loader applies CO-RE field relocations against the target kernel BTF at runtime.
+Build the legacy callback-ABI object by adding `-DBRUTAL_LEGACY_TCP_CC` and writing `brutal_legacy_linux_bpfel.o`. Use `-target bpfeb` and the corresponding `*_bpfeb.o` output names when building for a big-endian Linux target. The Go package selects the current or legacy object according to the running kernel BTF and host byte order. The matching object must exist before building any package or binary that imports `github.com/phuslu/tcp-brutal`; build it against kernel BTF that contains the TCP structures and callbacks used by `brutal.c`. The loader applies standard field, type, and enum CO-RE relocations against the target kernel BTF at runtime.
 
 ## Package API
 
@@ -48,7 +48,7 @@ func main() {
 }
 ```
 
-`Load()` reads `/proc/sys/net/ipv4/tcp_available_congestion_control`. If `brutal` is already available, it returns nil without touching existing BPF state. Otherwise, it loads and pins the eBPF programs with the default cgroup and fixed bpffs pin paths.
+`Load()` validates the complete managed installation: the `brutal` algorithm must be registered, `/sys/fs/bpf/brutal_cc` must be the expected pinned `struct_ops` link, and `/sys/fs/bpf/brutal_setsockopt` must be the expected cgroup link for the selected cgroup. It returns nil only when all three checks agree. A partial or foreign state is reported instead of being silently accepted.
 
 Advanced callers can use:
 
@@ -59,7 +59,7 @@ err := brutal.Options{
 }.Load()
 ```
 
-The loader pins BPF objects at `/sys/fs/bpf/brutal_cc` and `/sys/fs/bpf/brutal_setsockopt`. `Force` only cleans stale pins when `brutal` is not already available. `Unload()` and `UnloadWithOptions()` remove the BPF state pinned by this package.
+The loader pins BPF links at `/sys/fs/bpf/brutal_cc` and `/sys/fs/bpf/brutal_setsockopt`. Loading is transactional: failures remove newly created pins and close all new links. `Force` replaces a complete or partial managed installation and then verifies that cleanup succeeded; it does not unregister an unrelated `brutal` implementation that has no managed pins. `Unload()` and `UnloadWithOptions()` detach the pinned links. `CgroupPath` is only needed during unload when migrating an installation made by the older program-pin loader.
 
 ## CLI
 

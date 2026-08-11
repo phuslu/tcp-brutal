@@ -71,7 +71,7 @@ func parseLoadArgs(args []string) (loadOptions, error) {
 	fs := flag.NewFlagSet("load", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.StringVar(&opts.CgroupPath, "cgroup", opts.CgroupPath, "cgroup v2 path")
-	fs.BoolVar(&opts.Force, "force", false, "unload existing pins before loading if brutal is not already available")
+	fs.BoolVar(&opts.Force, "force", false, "replace any existing TCP Brutal installation")
 	fs.BoolVar(&opts.foreground, "foreground", false, "wait in the foreground and unload on signal")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
@@ -89,7 +89,7 @@ func parseUnloadArgs(args []string) (brutal.Options, error) {
 
 	fs := flag.NewFlagSet("unload", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	fs.StringVar(&opts.CgroupPath, "cgroup", opts.CgroupPath, "cgroup v2 path")
+	fs.StringVar(&opts.CgroupPath, "cgroup", opts.CgroupPath, "cgroup v2 path (needed for legacy pin cleanup only)")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
@@ -100,12 +100,12 @@ func parseUnloadArgs(args []string) (brutal.Options, error) {
 }
 
 func runLoad(opts loadOptions) error {
-	if brutal.IsLoaded() {
-		return nil
-	}
-
+	alreadyLoaded := !opts.Force && opts.Options.IsLoaded()
 	if err := brutal.LoadWithOptions(opts.Options); err != nil {
 		return err
+	}
+	if alreadyLoaded {
+		return nil
 	}
 
 	if !opts.foreground {

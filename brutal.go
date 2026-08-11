@@ -39,17 +39,24 @@ const (
 	bpfProgLoad     = 5
 	bpfObjPin       = 6
 	bpfObjGet       = 7
-	bpfProgAttach   = 8
 	bpfProgDetach   = 9
+	bpfProgGetFD    = 13
+	bpfMapGetFD     = 14
+	bpfObjGetInfo   = 15
 	bpfBTFLoad      = 18
+	bpfLinkCreate   = 28
+	bpfLinkDetach   = 34
 	bpfMapTypeSk    = 24
 	bpfMapTypeOps   = 26
 	bpfProgCgrpOpt  = 25
 	bpfProgOps      = 27
 	bpfAttachSetOpt = 22
+	bpfAttachOps    = 44
+	bpfLinkCgroup   = 3
+	bpfLinkOps      = 9
 	bpfFSMagic      = uint32(0xcafe4a11)
 	bpfFNoPrealloc  = 1
-	bpfFAllowMulti  = 2
+	bpfFLink        = 1 << 13
 	bpfPseudoMapFD  = 1
 	rlimitMemlock   = 8
 )
@@ -66,9 +73,17 @@ const (
 
 	bpfCoreFieldByteOffset = 0
 	bpfCoreFieldByteSize   = 1
+	bpfCoreFieldExists     = 2
 	bpfCoreFieldSigned     = 3
 	bpfCoreFieldLShiftU64  = 4
 	bpfCoreFieldRShiftU64  = 5
+	bpfCoreTypeIDLocal     = 6
+	bpfCoreTypeIDTarget    = 7
+	bpfCoreTypeExists      = 8
+	bpfCoreTypeSize        = 9
+	bpfCoreEnumvalExists   = 10
+	bpfCoreEnumvalValue    = 11
+	bpfCoreTypeMatches     = 12
 
 	btfMagic     = 0xeb9f
 	btfKindFlag  = uint32(1 << 31)
@@ -106,7 +121,8 @@ type Options struct {
 }
 
 type loadedBPF struct {
-	fds []int
+	fds  []int
+	pins []string
 }
 
 type bpfObject struct {
@@ -176,6 +192,57 @@ type structOpsMember struct {
 	index  uint32
 	offset uint32
 	typeID uint32
+}
+
+type pinnedLinkState struct {
+	exists bool
+	valid  bool
+	reason string
+}
+
+type bpfFDKind uint8
+
+const (
+	bpfFDUnknown bpfFDKind = iota
+	bpfFDMap
+	bpfFDProgram
+	bpfFDLink
+)
+
+type installationState struct {
+	algorithm  bool
+	structOps  pinnedLinkState
+	setsockopt pinnedLinkState
+}
+
+func (s installationState) complete() bool {
+	return s.algorithm && s.structOps.valid && s.setsockopt.valid
+}
+
+func (s installationState) empty() bool {
+	return !s.algorithm && !s.structOps.exists && !s.setsockopt.exists
+}
+
+func (s installationState) summary() string {
+	parts := make([]string, 0, 3)
+	if s.algorithm {
+		parts = append(parts, "algorithm is registered")
+	} else {
+		parts = append(parts, "algorithm is not registered")
+	}
+	appendPin := func(name string, pin pinnedLinkState) {
+		switch {
+		case !pin.exists:
+			parts = append(parts, name+" link is missing")
+		case !pin.valid:
+			parts = append(parts, name+" link is invalid: "+pin.reason)
+		default:
+			parts = append(parts, name+" link is valid")
+		}
+	}
+	appendPin("struct_ops", s.structOps)
+	appendPin("setsockopt", s.setsockopt)
+	return strings.Join(parts, "; ")
 }
 
 type mapCreateAttr struct {
@@ -261,16 +328,6 @@ type objPinAttr struct {
 	_         [4]byte
 }
 
-type progAttachAttr struct {
-	TargetFd         uint32
-	AttachBpfFd      uint32
-	AttachType       uint32
-	AttachFlags      uint32
-	ReplaceBpfFd     uint32
-	RelativeFdOrID   uint32
-	ExpectedRevision uint64
-}
-
 type progDetachAttr struct {
 	TargetFd         uint32
 	AttachBpfFd      uint32
@@ -279,6 +336,63 @@ type progDetachAttr struct {
 	_                uint32
 	RelativeFdOrID   uint32
 	ExpectedRevision uint64
+}
+
+type linkCreateAttr struct {
+	ProgOrMapFd uint32
+	TargetFd    uint32
+	AttachType  uint32
+	Flags       uint32
+	Extra       [48]byte
+}
+
+type linkDetachAttr struct {
+	LinkFd uint32
+}
+
+type objInfoAttr struct {
+	BpfFd   uint32
+	InfoLen uint32
+	Info    uint64
+}
+
+type idAttr struct {
+	ID        uint32
+	NextID    uint32
+	OpenFlags uint32
+}
+
+type bpfLinkInfo struct {
+	Type   uint32
+	ID     uint32
+	ProgID uint32
+	_      uint32
+	Data   [64]byte
+}
+
+type bpfProgInfo struct {
+	Type            uint32
+	ID              uint32
+	Tag             [8]byte
+	JitedProgLen    uint32
+	XlatedProgLen   uint32
+	JitedProgInsns  uint64
+	XlatedProgInsns uint64
+	LoadTime        uint64
+	CreatedByUID    uint32
+	NrMapIDs        uint32
+	MapIDs          uint64
+	Name            [16]byte
+}
+
+type bpfMapInfo struct {
+	Type       uint32
+	ID         uint32
+	KeySize    uint32
+	ValueSize  uint32
+	MaxEntries uint32
+	MapFlags   uint32
+	Name       [16]byte
 }
 
 func Load() error {
@@ -291,31 +405,61 @@ func (opts Options) Load() error {
 
 func LoadWithOptions(opts Options) error {
 	opts = opts.withDefaults()
+	if err := ensurePinRoot(); err != nil {
+		return err
+	}
 
-	if IsLoaded() {
-		return nil
+	state, err := inspectInstallation(opts)
+	if err != nil {
+		return fmt.Errorf("inspect existing TCP Brutal installation: %w", err)
+	}
+	if opts.Force {
+		if !state.empty() {
+			if err := unload(opts); err != nil {
+				return fmt.Errorf("remove existing TCP Brutal installation: %w", err)
+			}
+			state, err = inspectInstallation(opts)
+			if err != nil {
+				return fmt.Errorf("verify TCP Brutal cleanup: %w", err)
+			}
+			if !state.empty() {
+				return fmt.Errorf("TCP Brutal state remains after forced cleanup: %s", state.summary())
+			}
+		}
+	} else {
+		if state.complete() {
+			return nil
+		}
+		if !state.empty() {
+			return fmt.Errorf("incomplete TCP Brutal installation: %s; retry with Force to repair managed pins", state.summary())
+		}
 	}
 
 	if err := removeMemlockLimit(); err != nil {
 		return fmt.Errorf("raise memlock rlimit: %w", err)
 	}
 
-	if opts.Force {
-		if err := unload(opts); err != nil {
-			return err
-		}
-	}
-
-	if err := ensurePinRoot(); err != nil {
-		return err
-	}
-
-	loadedBPF, err := loadBPF(opts)
+	loaded, err := loadBPF(opts)
 	if err != nil {
 		return err
 	}
-	loadedBPF.close()
-	return nil
+	loaded.close()
+
+	state, err = inspectInstallation(opts)
+	if err == nil && state.complete() {
+		return nil
+	}
+	cleanupErr := unload(opts)
+	if err != nil {
+		if cleanupErr != nil {
+			return fmt.Errorf("verify loaded TCP Brutal installation: %v; cleanup: %w", err, cleanupErr)
+		}
+		return fmt.Errorf("verify loaded TCP Brutal installation: %w", err)
+	}
+	if cleanupErr != nil {
+		return fmt.Errorf("loaded TCP Brutal installation is incomplete: %s; cleanup: %w", state.summary(), cleanupErr)
+	}
+	return fmt.Errorf("loaded TCP Brutal installation is incomplete: %s", state.summary())
 }
 
 func Unload() error {
@@ -331,16 +475,29 @@ func UnloadWithOptions(opts Options) error {
 }
 
 func IsLoaded() bool {
+	return IsLoadedWithOptions(Options{})
+}
+
+func IsLoadedWithOptions(opts Options) bool {
+	state, err := inspectInstallation(opts.withDefaults())
+	return err == nil && state.complete()
+}
+
+func (opts Options) IsLoaded() bool {
+	return IsLoadedWithOptions(opts)
+}
+
+func algorithmAvailable() (bool, error) {
 	data, err := os.ReadFile(tcpAvailableCongestionControl)
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, algo := range strings.Fields(string(data)) {
 		if algo == "brutal" {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func (opts Options) withDefaults() Options {
@@ -348,6 +505,248 @@ func (opts Options) withDefaults() Options {
 		opts.CgroupPath = defaultCgroupPath
 	}
 	return opts
+}
+
+func inspectInstallation(opts Options) (installationState, error) {
+	var state installationState
+	var err error
+	state.algorithm, err = algorithmAvailable()
+	if err != nil {
+		return state, err
+	}
+	state.structOps, err = inspectStructOpsLink(structOpsPinPath)
+	if err != nil {
+		return state, err
+	}
+	state.setsockopt, err = inspectSetsockoptLink(setsockoptPinPath, opts.CgroupPath)
+	if err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
+func inspectStructOpsLink(path string) (pinnedLinkState, error) {
+	state, info, err := inspectPinnedLink(path, bpfLinkOps)
+	if err != nil || !state.valid {
+		return state, err
+	}
+
+	mapID := nativeByteOrder().Uint32(info.Data[:4])
+	if mapID == 0 {
+		state.valid = false
+		state.reason = "link has no struct_ops map"
+		return state, nil
+	}
+	fd, err := mapGetFDByID(mapID)
+	if err != nil {
+		return state, fmt.Errorf("open struct_ops map id %d: %w", mapID, err)
+	}
+	defer syscall.Close(fd)
+	mapInfo, err := getMapInfo(fd)
+	if err != nil {
+		return state, fmt.Errorf("inspect struct_ops map id %d: %w", mapID, err)
+	}
+	if mapInfo.Type != bpfMapTypeOps {
+		state.valid = false
+		state.reason = fmt.Sprintf("map id %d has type %d", mapID, mapInfo.Type)
+	} else if mapInfo.MapFlags&bpfFLink == 0 {
+		state.valid = false
+		state.reason = fmt.Sprintf("map id %d is not link-managed", mapID)
+	} else if cString(mapInfo.Name[:]) != "brutal" {
+		state.valid = false
+		state.reason = fmt.Sprintf("map id %d has name %q", mapID, cString(mapInfo.Name[:]))
+	}
+	return state, nil
+}
+
+func validateStructOpsLinkInfo(info bpfLinkInfo) error {
+	if info.Type != bpfLinkOps {
+		return fmt.Errorf("link type is %d, want %d", info.Type, bpfLinkOps)
+	}
+	mapID := nativeByteOrder().Uint32(info.Data[:4])
+	if mapID == 0 {
+		// A successfully detached struct_ops link stays pinnable but no longer
+		// reports a map. It is safe to remove that defunct managed pin.
+		return nil
+	}
+	fd, err := mapGetFDByID(mapID)
+	if err != nil {
+		return fmt.Errorf("open struct_ops map id %d: %w", mapID, err)
+	}
+	defer syscall.Close(fd)
+	mapInfo, err := getMapInfo(fd)
+	if err != nil {
+		return fmt.Errorf("inspect struct_ops map id %d: %w", mapID, err)
+	}
+	if mapInfo.Type != bpfMapTypeOps || mapInfo.MapFlags&bpfFLink == 0 || cString(mapInfo.Name[:]) != "brutal" {
+		return fmt.Errorf("map id %d has type %d, name %q, flags %#x", mapID, mapInfo.Type, cString(mapInfo.Name[:]), mapInfo.MapFlags)
+	}
+	return nil
+}
+
+func inspectSetsockoptLink(path, cgroupPath string) (pinnedLinkState, error) {
+	state, info, err := inspectPinnedLink(path, bpfLinkCgroup)
+	if err != nil || !state.valid {
+		return state, err
+	}
+
+	order := nativeByteOrder()
+	cgroupID := order.Uint64(info.Data[:8])
+	attachType := order.Uint32(info.Data[8:12])
+	if attachType != bpfAttachSetOpt {
+		state.valid = false
+		state.reason = fmt.Sprintf("attach type is %d, want %d", attachType, bpfAttachSetOpt)
+		return state, nil
+	}
+	var stat syscall.Stat_t
+	if err := syscall.Stat(cgroupPath, &stat); err != nil {
+		return state, fmt.Errorf("stat cgroup %s: %w", cgroupPath, err)
+	}
+	if cgroupID != stat.Ino {
+		state.valid = false
+		state.reason = fmt.Sprintf("cgroup id is %d, want %d for %s", cgroupID, stat.Ino, cgroupPath)
+		return state, nil
+	}
+	if info.ProgID == 0 {
+		state.valid = false
+		state.reason = "link has no program"
+		return state, nil
+	}
+	fd, err := progGetFDByID(info.ProgID)
+	if err != nil {
+		return state, fmt.Errorf("open setsockopt program id %d: %w", info.ProgID, err)
+	}
+	defer syscall.Close(fd)
+	progInfo, err := getProgInfo(fd)
+	if err != nil {
+		return state, fmt.Errorf("inspect setsockopt program id %d: %w", info.ProgID, err)
+	}
+	if progInfo.Type != bpfProgCgrpOpt {
+		state.valid = false
+		state.reason = fmt.Sprintf("program id %d has type %d", info.ProgID, progInfo.Type)
+	} else if cString(progInfo.Name[:]) != bpfKernelName("brutal_setsockopt") {
+		state.valid = false
+		state.reason = fmt.Sprintf("program id %d has name %q", info.ProgID, cString(progInfo.Name[:]))
+	}
+	return state, nil
+}
+
+func validateSetsockoptLinkInfo(info bpfLinkInfo) error {
+	if info.Type != bpfLinkCgroup {
+		return fmt.Errorf("link type is %d, want %d", info.Type, bpfLinkCgroup)
+	}
+	attachType := nativeByteOrder().Uint32(info.Data[8:12])
+	if attachType != bpfAttachSetOpt {
+		return fmt.Errorf("attach type is %d, want %d", attachType, bpfAttachSetOpt)
+	}
+	if info.ProgID == 0 {
+		if nativeByteOrder().Uint64(info.Data[:8]) == 0 {
+			// A defunct cgroup link has neither a target nor a program.
+			return nil
+		}
+		return errors.New("link has no program")
+	}
+	fd, err := progGetFDByID(info.ProgID)
+	if err != nil {
+		return fmt.Errorf("open setsockopt program id %d: %w", info.ProgID, err)
+	}
+	defer syscall.Close(fd)
+	progInfo, err := getProgInfo(fd)
+	if err != nil {
+		return fmt.Errorf("inspect setsockopt program id %d: %w", info.ProgID, err)
+	}
+	if progInfo.Type != bpfProgCgrpOpt || cString(progInfo.Name[:]) != bpfKernelName("brutal_setsockopt") {
+		return fmt.Errorf("program id %d has type %d and name %q", info.ProgID, progInfo.Type, cString(progInfo.Name[:]))
+	}
+	return nil
+}
+
+func inspectPinnedLink(path string, expectedType uint32) (pinnedLinkState, bpfLinkInfo, error) {
+	var state pinnedLinkState
+	var info bpfLinkInfo
+	fd, err := objGet(path)
+	if errors.Is(err, syscall.ENOENT) {
+		return state, info, nil
+	}
+	if err != nil {
+		return state, info, fmt.Errorf("open pinned object %s: %w", path, err)
+	}
+	defer syscall.Close(fd)
+	state.exists = true
+	kind, err := bpfObjectKind(fd)
+	if err != nil {
+		return state, info, fmt.Errorf("identify pinned object %s: %w", path, err)
+	}
+	if kind != bpfFDLink {
+		state.reason = fmt.Sprintf("object kind is %s, want link", kind)
+		return state, info, nil
+	}
+	info, err = getLinkInfo(fd)
+	if err != nil {
+		return state, info, fmt.Errorf("inspect pinned object %s: %w", path, err)
+	}
+	if info.Type != expectedType {
+		state.reason = fmt.Sprintf("object type is %d, want link type %d", info.Type, expectedType)
+		return state, info, nil
+	}
+	state.valid = true
+	return state, info, nil
+}
+
+func (kind bpfFDKind) String() string {
+	switch kind {
+	case bpfFDMap:
+		return "map"
+	case bpfFDProgram:
+		return "program"
+	case bpfFDLink:
+		return "link"
+	default:
+		return "unknown"
+	}
+}
+
+func bpfKernelName(name string) string {
+	var value [16]byte
+	setObjName(&value, name)
+	return cString(value[:])
+}
+
+func bpfObjectKind(fd int) (bpfFDKind, error) {
+	data, err := os.ReadFile("/proc/self/fdinfo/" + strconv.Itoa(fd))
+	if err != nil {
+		return bpfFDUnknown, fmt.Errorf("read BPF fdinfo for fd %d: %w", fd, err)
+	}
+	kind, err := parseBPFObjectKind(data)
+	if err != nil {
+		return bpfFDUnknown, fmt.Errorf("identify BPF fd %d: %w", fd, err)
+	}
+	return kind, nil
+}
+
+func parseBPFObjectKind(data []byte) (bpfFDKind, error) {
+	kind := bpfFDUnknown
+	for _, line := range strings.Split(string(data), "\n") {
+		var found bpfFDKind
+		switch {
+		case strings.HasPrefix(line, "map_type:\t"):
+			found = bpfFDMap
+		case strings.HasPrefix(line, "prog_type:\t"):
+			found = bpfFDProgram
+		case strings.HasPrefix(line, "link_type:\t"):
+			found = bpfFDLink
+		default:
+			continue
+		}
+		if kind != bpfFDUnknown && kind != found {
+			return bpfFDUnknown, errors.New("fdinfo contains conflicting BPF object kinds")
+		}
+		kind = found
+	}
+	if kind == bpfFDUnknown {
+		return bpfFDUnknown, errors.New("fdinfo contains no BPF object type")
+	}
+	return kind, nil
 }
 
 func loadBPF(opts Options) (_ *loadedBPF, err error) {
@@ -388,7 +787,7 @@ func loadBPF(opts Options) (_ *loadedBPF, err error) {
 	loaded := &loadedBPF{fds: []int{skStorage}}
 	defer func() {
 		if err != nil {
-			loaded.close()
+			loaded.rollback()
 		}
 	}()
 
@@ -405,28 +804,35 @@ func loadBPF(opts Options) (_ *loadedBPF, err error) {
 		return nil, err
 	}
 	loaded.fds = append(loaded.fds, structMap)
-	defer func() {
-		if err != nil {
-			_ = unregisterStructOps(structMap)
-			_ = unlinkIfExists(structOpsPinPath)
-		}
-	}()
 
-	value, err := obj.structOpsValue(opsInfo, programs)
+	value, err := obj.structOpsValue(opsInfo, kernelBTF, programs)
 	if err != nil {
 		return nil, err
 	}
 	if err = mapUpdate(structMap, 0, value); err != nil {
-		return nil, fmt.Errorf("register struct_ops brutal: %w", err)
+		return nil, fmt.Errorf("prepare struct_ops brutal: %w", err)
 	}
 
-	if err = objPin(structMap, structOpsPinPath); err != nil {
-		return nil, fmt.Errorf("pin struct_ops map %s: %w", structOpsPinPath, err)
+	structLink, err := linkCreate(structMap, 0, bpfAttachOps, 0)
+	if err != nil {
+		return nil, fmt.Errorf("attach struct_ops brutal: %w", err)
 	}
+	loaded.fds = append(loaded.fds, structLink)
 
-	if err = attachSetsockopt(programs["brutal_setsockopt"], opts.CgroupPath, setsockoptPinPath); err != nil {
+	setsockoptLink, err := attachSetsockopt(programs["brutal_setsockopt"], opts.CgroupPath)
+	if err != nil {
 		return nil, err
 	}
+	loaded.fds = append(loaded.fds, setsockoptLink)
+
+	if err = objPin(structLink, structOpsPinPath); err != nil {
+		return nil, fmt.Errorf("pin struct_ops link %s: %w", structOpsPinPath, err)
+	}
+	loaded.pins = append(loaded.pins, structOpsPinPath)
+	if err = objPin(setsockoptLink, setsockoptPinPath); err != nil {
+		return nil, fmt.Errorf("pin cgroup setsockopt link %s: %w", setsockoptPinPath, err)
+	}
+	loaded.pins = append(loaded.pins, setsockoptPinPath)
 
 	return loaded, nil
 }
@@ -441,6 +847,17 @@ func (l *loadedBPF) close() {
 	l.fds = nil
 }
 
+func (l *loadedBPF) rollback() {
+	if l == nil {
+		return
+	}
+	for i := len(l.pins) - 1; i >= 0; i-- {
+		_ = unlinkIfExists(l.pins[i])
+	}
+	l.pins = nil
+	l.close()
+}
+
 func selectObject(congControlParamCount int) ([]byte, string, error) {
 	var legacy bool
 	switch congControlParamCount {
@@ -448,6 +865,7 @@ func selectObject(congControlParamCount int) ([]byte, string, error) {
 		legacy = true
 	case 4:
 	case 0:
+
 		return nil, "", errors.New("kernel tcp_congestion_ops.cong_control has no parameters")
 	default:
 		return nil, "", fmt.Errorf("kernel tcp_congestion_ops.cong_control has %d parameters; Linux 6.0 or newer with a supported tcp_congestion_ops ABI is required", congControlParamCount)
@@ -885,14 +1303,11 @@ func (p *programSpec) applyCoreRelocs(insns []byte, localBTF, targetBTF *btfSpec
 		return errors.New("missing local or target BTF")
 	}
 	for _, rel := range p.coreRelocs {
-		if !isSupportedFieldCoreReloc(rel.kind) {
-			return fmt.Errorf("unsupported CO-RE relocation kind %d at instruction offset %#x", rel.kind, rel.insnOffset)
-		}
-		value, err := resolveCoreFieldReloc(localBTF, targetBTF, rel.typeID, rel.access, rel.kind, order)
+		value, err := resolveCoreReloc(localBTF, targetBTF, rel, order)
 		if err != nil {
 			return fmt.Errorf("resolve %q at instruction offset %#x: %w", rel.access, rel.insnOffset, err)
 		}
-		if err := patchCoreFieldReloc(insns, rel.insnOffset, value, order); err != nil {
+		if err := patchCoreReloc(insns, rel.insnOffset, value, order); err != nil {
 			return err
 		}
 	}
@@ -902,10 +1317,33 @@ func (p *programSpec) applyCoreRelocs(insns []byte, localBTF, targetBTF *btfSpec
 func isSupportedFieldCoreReloc(kind uint32) bool {
 	switch kind {
 	case bpfCoreFieldByteOffset, bpfCoreFieldByteSize, bpfCoreFieldSigned,
-		bpfCoreFieldLShiftU64, bpfCoreFieldRShiftU64:
+		bpfCoreFieldExists, bpfCoreFieldLShiftU64, bpfCoreFieldRShiftU64:
 		return true
 	default:
 		return false
+	}
+}
+
+func resolveCoreReloc(localBTF, targetBTF *btfSpec, rel coreReloc, order binary.ByteOrder) (uint64, error) {
+	if isSupportedFieldCoreReloc(rel.kind) {
+		return resolveCoreFieldReloc(localBTF, targetBTF, rel.typeID, rel.access, rel.kind, order)
+	}
+
+	switch rel.kind {
+	case bpfCoreTypeIDLocal:
+		if err := validateCoreTypeAccess(rel.access); err != nil {
+			return 0, err
+		}
+		if localBTF.typeByID(rel.typeID) == nil {
+			return 0, fmt.Errorf("local BTF type id %d not found", rel.typeID)
+		}
+		return uint64(rel.typeID), nil
+	case bpfCoreTypeIDTarget, bpfCoreTypeExists, bpfCoreTypeSize, bpfCoreTypeMatches:
+		return resolveCoreTypeReloc(localBTF, targetBTF, rel.typeID, rel.access, rel.kind)
+	case bpfCoreEnumvalExists, bpfCoreEnumvalValue:
+		return resolveCoreEnumReloc(localBTF, targetBTF, rel.typeID, rel.access, rel.kind)
+	default:
+		return 0, fmt.Errorf("unsupported CO-RE relocation kind %d", rel.kind)
 	}
 }
 
@@ -914,37 +1352,47 @@ type coreField struct {
 	bitOffset      uint32
 	bitfieldOffset uint32
 	bitfieldSize   uint32
+	loadSize       uint32
 }
 
-func resolveCoreFieldReloc(localBTF, targetBTF *btfSpec, typeID uint32, access string, kind uint32, order binary.ByteOrder) (uint32, error) {
+var errCoreTargetNotFound = errors.New("CO-RE target not found")
+
+func resolveCoreFieldReloc(localBTF, targetBTF *btfSpec, typeID uint32, access string, kind uint32, order binary.ByteOrder) (uint64, error) {
 	field, err := resolveCoreField(localBTF, targetBTF, typeID, access)
 	if err != nil {
+		if kind == bpfCoreFieldExists && errors.Is(err, errCoreTargetNotFound) {
+			return 0, nil
+		}
 		return 0, err
 	}
 
 	switch kind {
+	case bpfCoreFieldExists:
+		return 1, nil
+
 	case bpfCoreFieldByteOffset:
 		if field.bitfieldSize > 0 {
 			offset, err := targetBTF.coreBitfieldByteOffset(field)
 			if err != nil {
 				return 0, err
 			}
-			return offset, nil
+			return uint64(offset), nil
 		}
 		if field.bitOffset%8 != 0 {
 			return 0, fmt.Errorf("resolved bit offset %d is not byte aligned", field.bitOffset)
 		}
-		return field.bitOffset / 8, nil
+		return uint64(field.bitOffset / 8), nil
 
 	case bpfCoreFieldByteSize:
 		size, err := targetBTF.sizeof(field.typeID)
 		if err != nil {
 			return 0, err
 		}
-		return size, nil
+		return uint64(size), nil
 
 	case bpfCoreFieldSigned:
-		return targetBTF.coreFieldSigned(field.typeID)
+		value, err := targetBTF.coreFieldSigned(field.typeID)
+		return uint64(value), err
 
 	case bpfCoreFieldLShiftU64:
 		size, err := targetBTF.coreFieldBitSize(field)
@@ -955,17 +1403,20 @@ func resolveCoreFieldReloc(localBTF, targetBTF *btfSpec, typeID uint32, access s
 			if field.bitfieldOffset+size > 64 {
 				return 0, fmt.Errorf("bitfield exceeds u64 extraction width: offset %d size %d", field.bitfieldOffset, size)
 			}
-			return 64 - field.bitfieldOffset - size, nil
+			return uint64(64 - field.bitfieldOffset - size), nil
 		}
-		loadSize, err := targetBTF.sizeof(field.typeID)
-		if err != nil {
-			return 0, err
+		loadSize := field.loadSize
+		if loadSize == 0 {
+			loadSize, err = targetBTF.sizeof(field.typeID)
+			if err != nil {
+				return 0, err
+			}
 		}
 		loadBits := loadSize * 8
 		if loadBits > 64 || field.bitfieldOffset > loadBits {
 			return 0, fmt.Errorf("invalid big-endian bitfield extraction: offset %d load bits %d", field.bitfieldOffset, loadBits)
 		}
-		return 64 - loadBits + field.bitfieldOffset, nil
+		return uint64(64 - loadBits + field.bitfieldOffset), nil
 
 	case bpfCoreFieldRShiftU64:
 		size, err := targetBTF.coreFieldBitSize(field)
@@ -975,7 +1426,7 @@ func resolveCoreFieldReloc(localBTF, targetBTF *btfSpec, typeID uint32, access s
 		if size > 64 {
 			return 0, fmt.Errorf("field bit size %d exceeds u64 extraction width", size)
 		}
-		return 64 - size, nil
+		return uint64(64 - size), nil
 
 	default:
 		return 0, fmt.Errorf("unsupported CO-RE relocation kind %d", kind)
@@ -987,47 +1438,119 @@ func resolveCoreField(localBTF, targetBTF *btfSpec, typeID uint32, access string
 	if err != nil {
 		return coreField{}, err
 	}
-	if len(accessors) == 0 || accessors[0] != 0 {
-		return coreField{}, fmt.Errorf("unsupported access path %q", access)
+	if len(accessors) == 0 {
+		return coreField{}, fmt.Errorf("empty access path %q", access)
 	}
 
 	localType := localBTF.resolveType(typeID)
 	if localType == nil {
 		return coreField{}, fmt.Errorf("local BTF type id %d not found", typeID)
 	}
-	targetType := targetBTF.find(localType.kind, localType.name)
+	targetType := targetBTF.findCoreTargetType(localType)
 	if targetType == nil {
-		return coreField{}, fmt.Errorf("target BTF is missing %s %q", btfKindName(localType.kind), localType.name)
+		return coreField{}, fmt.Errorf("%w: target BTF is missing %s %q", errCoreTargetNotFound, btfKindName(localType.kind), localType.name)
+	}
+	if !coreFieldsCompatible(localBTF, targetBTF, localType.id, targetType.id, make(map[uint64]bool)) {
+		return coreField{}, fmt.Errorf("%w: target %s %q is incompatible", errCoreTargetNotFound, btfKindName(targetType.kind), targetType.name)
 	}
 
-	field := coreField{typeID: targetType.id}
-	for _, index := range accessors[1:] {
+	localSize, err := localBTF.sizeof(localType.id)
+	if err != nil {
+		return coreField{}, fmt.Errorf("size of local root type: %w", err)
+	}
+	if _, err := coreArrayBitOffset(accessors[0], localSize); err != nil {
+		return coreField{}, fmt.Errorf("local root array access: %w", err)
+	}
+	targetSize, err := targetBTF.sizeof(targetType.id)
+	if err != nil {
+		return coreField{}, fmt.Errorf("size of target root type: %w", err)
+	}
+	rootOffset, err := coreArrayBitOffset(accessors[0], targetSize)
+	if err != nil {
+		return coreField{}, fmt.Errorf("target root array access: %w", err)
+	}
+
+	field := coreField{typeID: targetType.id, bitOffset: rootOffset}
+	for position, index := range accessors[1:] {
 		localType = localBTF.resolveType(localType.id)
 		targetType = targetBTF.resolveType(targetType.id)
 		if localType == nil || targetType == nil {
 			return coreField{}, errors.New("invalid BTF type while resolving access path")
 		}
-		if localType.kind != btfKindStruct && localType.kind != btfKindUnion {
-			return coreField{}, fmt.Errorf("local type %q is not a struct or union", localType.name)
-		}
-		if targetType.kind != btfKindStruct && targetType.kind != btfKindUnion {
-			return coreField{}, fmt.Errorf("target type %q is not a struct or union", targetType.name)
-		}
-		if index >= uint32(len(localType.members)) {
-			return coreField{}, fmt.Errorf("member index %d is outside local type %q", index, localType.name)
+
+		switch localType.kind {
+		case btfKindStruct, btfKindUnion:
+			if index >= uint32(len(localType.members)) {
+				return coreField{}, fmt.Errorf("member index %d is outside local type %q", index, localType.name)
+			}
+			localMember := localType.members[index]
+			if localMember.name == "" {
+				localType = localBTF.resolveType(localMember.typeID)
+				if localType == nil || (localType.kind != btfKindStruct && localType.kind != btfKindUnion) {
+					return coreField{}, errors.New("anonymous local member is not a struct or union")
+				}
+				continue
+			}
+			if targetType.kind != btfKindStruct && targetType.kind != btfKindUnion {
+				return coreField{}, fmt.Errorf("%w: target type %q is not a struct or union", errCoreTargetNotFound, targetType.name)
+			}
+			targetMember, err := targetBTF.findCoreMember(targetType, localMember.name)
+			if err != nil {
+				return coreField{}, err
+			}
+			field.bitOffset, err = addCoreBitOffset(field.bitOffset, targetMember.bitOffset)
+			if err != nil {
+				return coreField{}, err
+			}
+			field.typeID = targetMember.typeID
+			field.bitfieldSize = targetMember.bitfieldSize
+			field.bitfieldOffset = 0
+			field.loadSize = 0
+			localType = localBTF.resolveType(localMember.typeID)
+			targetType = targetBTF.resolveType(targetMember.typeID)
+			if (localMember.bitfieldSize != 0 || targetMember.bitfieldSize != 0) && position+1 < len(accessors[1:]) {
+				return coreField{}, errors.New("cannot descend into a bitfield")
+			}
+
+		case btfKindArray:
+			if localType.array == nil {
+				return coreField{}, fmt.Errorf("local array type %d has no metadata", localType.id)
+			}
+			if targetType.kind != btfKindArray || targetType.array == nil {
+				return coreField{}, fmt.Errorf("%w: target type is not an array", errCoreTargetNotFound)
+			}
+			if localType.array.nelems != 0 && index >= localType.array.nelems {
+				return coreField{}, fmt.Errorf("array index %d is outside local array of %d elements", index, localType.array.nelems)
+			}
+			if targetType.array.nelems != 0 && index >= targetType.array.nelems {
+				return coreField{}, fmt.Errorf("%w: array index %d is outside target array of %d elements", errCoreTargetNotFound, index, targetType.array.nelems)
+			}
+			elementSize, err := targetBTF.sizeof(targetType.array.typeID)
+			if err != nil {
+				return coreField{}, err
+			}
+			offset, err := coreArrayBitOffset(index, elementSize)
+			if err != nil {
+				return coreField{}, err
+			}
+			field.bitOffset, err = addCoreBitOffset(field.bitOffset, offset)
+			if err != nil {
+				return coreField{}, err
+			}
+			field.typeID = targetType.array.typeID
+			field.bitfieldSize = 0
+			field.bitfieldOffset = 0
+			field.loadSize = 0
+			localType = localBTF.resolveType(localType.array.typeID)
+			targetType = targetBTF.resolveType(targetType.array.typeID)
+
+		default:
+			return coreField{}, fmt.Errorf("cannot descend into local %s %q", btfKindName(localType.kind), localType.name)
 		}
 
-		localMember := localType.members[index]
-		targetMember := targetType.matchCoreMember(localMember.name, index)
-		if targetMember == nil {
-			return coreField{}, fmt.Errorf("target type %q is missing member %q", targetType.name, localMember.name)
+		if localType == nil || targetType == nil || !coreFieldsCompatible(localBTF, targetBTF, localType.id, targetType.id, make(map[uint64]bool)) {
+			return coreField{}, fmt.Errorf("%w: field types are incompatible", errCoreTargetNotFound)
 		}
-		field.bitOffset += targetMember.bitOffset
-		field.typeID = targetMember.typeID
-		field.bitfieldSize = targetMember.bitfieldSize
-		field.bitfieldOffset = 0
-		localType = localBTF.resolveType(localMember.typeID)
-		targetType = targetBTF.resolveType(targetMember.typeID)
 	}
 
 	if field.bitfieldSize > 0 {
@@ -1036,6 +1559,296 @@ func resolveCoreField(localBTF, targetBTF *btfSpec, typeID uint32, access string
 		}
 	}
 	return field, nil
+}
+
+func coreArrayBitOffset(index, elementSize uint32) (uint32, error) {
+	offset := uint64(index) * uint64(elementSize) * 8
+	if offset > uint64(^uint32(0)) {
+		return 0, errors.New("CO-RE array offset overflows uint32")
+	}
+	return uint32(offset), nil
+}
+
+func addCoreBitOffset(base, offset uint32) (uint32, error) {
+	result := uint64(base) + uint64(offset)
+	if result > uint64(^uint32(0)) {
+		return 0, errors.New("CO-RE field offset overflows uint32")
+	}
+	return uint32(result), nil
+}
+
+func coreFieldsCompatible(localBTF, targetBTF *btfSpec, localID, targetID uint32, visited map[uint64]bool) bool {
+	localType := localBTF.resolveType(localID)
+	targetType := targetBTF.resolveType(targetID)
+	if localType == nil || targetType == nil {
+		return localID == 0 && targetID == 0
+	}
+	key := uint64(localType.id)<<32 | uint64(targetType.id)
+	if visited[key] {
+		return true
+	}
+	visited[key] = true
+
+	localComposite := localType.kind == btfKindStruct || localType.kind == btfKindUnion
+	targetComposite := targetType.kind == btfKindStruct || targetType.kind == btfKindUnion
+	if localComposite || targetComposite {
+		return localComposite && targetComposite
+	}
+	if isCoreEnumKind(localType.kind) || isCoreEnumKind(targetType.kind) {
+		return isCoreEnumKind(localType.kind) && isCoreEnumKind(targetType.kind) &&
+			coreNamesMatch(localType.name, targetType.name)
+	}
+	if localType.kind != targetType.kind {
+		return false
+	}
+
+	switch localType.kind {
+	case btfKindPtr, btfKindInt, btfKindFloat:
+		return true
+	case btfKindArray:
+		return localType.array != nil && targetType.array != nil &&
+			coreFieldsCompatible(localBTF, targetBTF, localType.array.typeID, targetType.array.typeID, visited)
+	case btfKindFwd:
+		return coreNamesMatch(localType.name, targetType.name)
+	default:
+		return false
+	}
+}
+
+func isCoreEnumKind(kind uint32) bool {
+	return kind == btfKindEnum || kind == btfKindEnum64
+}
+
+func coreNamesMatch(local, target string) bool {
+	return local == "" || target == "" || coreEssentialName(local) == coreEssentialName(target)
+}
+
+func validateCoreTypeAccess(access string) error {
+	accessors, err := parseCoreAccess(access)
+	if err != nil {
+		return err
+	}
+	if len(accessors) != 1 || accessors[0] != 0 {
+		return fmt.Errorf("type relocation requires access path 0, got %q", access)
+	}
+	return nil
+}
+
+func resolveCoreTypeReloc(localBTF, targetBTF *btfSpec, typeID uint32, access string, kind uint32) (uint64, error) {
+	if err := validateCoreTypeAccess(access); err != nil {
+		return 0, err
+	}
+	localType := localBTF.resolveType(typeID)
+	if localType == nil {
+		return 0, fmt.Errorf("local BTF type id %d not found", typeID)
+	}
+	targetType := targetBTF.findCoreTargetType(localType)
+	if targetType == nil {
+		if kind == bpfCoreTypeExists || kind == bpfCoreTypeMatches {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("%w: target BTF is missing %s %q", errCoreTargetNotFound, btfKindName(localType.kind), localType.name)
+	}
+
+	if kind == bpfCoreTypeMatches {
+		if coreTypesMatch(localBTF, targetBTF, localType.id, targetType.id, make(map[uint64]bool)) {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	compatible := coreTypesCompatible(localBTF, targetBTF, localType.id, targetType.id, make(map[uint64]bool))
+	if kind == bpfCoreTypeExists {
+		if compatible {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	if !compatible {
+		return 0, fmt.Errorf("%w: target %s %q is incompatible", errCoreTargetNotFound, btfKindName(targetType.kind), targetType.name)
+	}
+
+	switch kind {
+	case bpfCoreTypeIDTarget:
+		return uint64(targetType.id), nil
+	case bpfCoreTypeSize:
+		size, err := targetBTF.sizeof(targetType.id)
+		return uint64(size), err
+	default:
+		return 0, fmt.Errorf("unsupported type CO-RE relocation kind %d", kind)
+	}
+}
+
+func resolveCoreEnumReloc(localBTF, targetBTF *btfSpec, typeID uint32, access string, kind uint32) (uint64, error) {
+	accessors, err := parseCoreAccess(access)
+	if err != nil {
+		return 0, err
+	}
+	if len(accessors) != 1 {
+		return 0, fmt.Errorf("enum relocation requires one value index, got %q", access)
+	}
+	localType := localBTF.resolveType(typeID)
+	if localType == nil || !isCoreEnumKind(localType.kind) {
+		return 0, fmt.Errorf("local BTF type id %d is not an enum", typeID)
+	}
+	index := accessors[0]
+	if index >= uint32(len(localType.enumValues)) {
+		return 0, fmt.Errorf("enum value index %d is outside local enum %q", index, localType.name)
+	}
+	localValue := localType.enumValues[index]
+	targetType := targetBTF.findCoreTargetType(localType)
+	if targetType == nil || !isCoreEnumKind(targetType.kind) {
+		if kind == bpfCoreEnumvalExists {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("%w: target BTF is missing enum %q", errCoreTargetNotFound, localType.name)
+	}
+	for _, targetValue := range targetType.enumValues {
+		if coreEssentialName(targetValue.name) != coreEssentialName(localValue.name) {
+			continue
+		}
+		if kind == bpfCoreEnumvalExists {
+			return 1, nil
+		}
+		if kind == bpfCoreEnumvalValue {
+			return targetValue.value, nil
+		}
+		return 0, fmt.Errorf("unsupported enum CO-RE relocation kind %d", kind)
+	}
+	if kind == bpfCoreEnumvalExists {
+		return 0, nil
+	}
+	return 0, fmt.Errorf("%w: target enum %q is missing value %q", errCoreTargetNotFound, targetType.name, localValue.name)
+}
+
+func coreTypesCompatible(localBTF, targetBTF *btfSpec, localID, targetID uint32, visited map[uint64]bool) bool {
+	if localID == 0 || targetID == 0 {
+		return localID == targetID
+	}
+	localType := localBTF.resolveType(localID)
+	targetType := targetBTF.resolveType(targetID)
+	if localType == nil || targetType == nil {
+		return false
+	}
+	key := uint64(localType.id)<<32 | uint64(targetType.id)
+	if visited[key] {
+		return true
+	}
+	visited[key] = true
+
+	if isCoreEnumKind(localType.kind) || isCoreEnumKind(targetType.kind) {
+		return isCoreEnumKind(localType.kind) && isCoreEnumKind(targetType.kind)
+	}
+	if localType.kind != targetType.kind {
+		return false
+	}
+	switch localType.kind {
+	case btfKindInt, btfKindStruct, btfKindUnion, btfKindFwd, btfKindFloat:
+		return true
+	case btfKindPtr, btfKindFunc:
+		return coreTypesCompatible(localBTF, targetBTF, localType.typeID, targetType.typeID, visited)
+	case btfKindArray:
+		return localType.array != nil && targetType.array != nil &&
+			coreTypesCompatible(localBTF, targetBTF, localType.array.indexTypeID, targetType.array.indexTypeID, visited) &&
+			coreTypesCompatible(localBTF, targetBTF, localType.array.typeID, targetType.array.typeID, visited)
+	case btfKindFuncProto:
+		if len(localType.params) != len(targetType.params) ||
+			!coreTypesCompatible(localBTF, targetBTF, localType.typeID, targetType.typeID, visited) {
+			return false
+		}
+		for i := range localType.params {
+			if !coreTypesCompatible(localBTF, targetBTF, localType.params[i], targetType.params[i], visited) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func coreTypesMatch(localBTF, targetBTF *btfSpec, localID, targetID uint32, visited map[uint64]bool) bool {
+	if localID == 0 || targetID == 0 {
+		return localID == targetID
+	}
+	localType := localBTF.resolveType(localID)
+	targetType := targetBTF.resolveType(targetID)
+	if localType == nil || targetType == nil || !coreNamesMatch(localType.name, targetType.name) {
+		return false
+	}
+	key := uint64(localType.id)<<32 | uint64(targetType.id)
+	if visited[key] {
+		return true
+	}
+	visited[key] = true
+
+	if isCoreEnumKind(localType.kind) || isCoreEnumKind(targetType.kind) {
+		if !isCoreEnumKind(localType.kind) || !isCoreEnumKind(targetType.kind) || localType.size != targetType.size {
+			return false
+		}
+		for _, localValue := range localType.enumValues {
+			found := false
+			for _, targetValue := range targetType.enumValues {
+				if coreNamesMatch(localValue.name, targetValue.name) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+	if localType.kind != targetType.kind {
+		return false
+	}
+
+	switch localType.kind {
+	case btfKindInt:
+		return localType.size == targetType.size &&
+			(localType.intEncoding&btfIntSigned != 0) == (targetType.intEncoding&btfIntSigned != 0)
+	case btfKindFloat:
+		return localType.size == targetType.size
+	case btfKindFwd:
+		return localType.kindFlag == targetType.kindFlag
+	case btfKindPtr, btfKindFunc:
+		return coreTypesMatch(localBTF, targetBTF, localType.typeID, targetType.typeID, visited)
+	case btfKindArray:
+		return localType.array != nil && targetType.array != nil &&
+			localType.array.nelems == targetType.array.nelems &&
+			coreTypesMatch(localBTF, targetBTF, localType.array.typeID, targetType.array.typeID, visited)
+	case btfKindStruct, btfKindUnion:
+		if len(localType.members) > len(targetType.members) {
+			return false
+		}
+		for i, localMember := range localType.members {
+			var targetMember *btfMember
+			if localMember.name == "" {
+				if i < len(targetType.members) {
+					targetMember = &targetType.members[i]
+				}
+			} else {
+				targetMember = targetType.member(localMember.name)
+			}
+			if targetMember == nil || !coreTypesMatch(localBTF, targetBTF, localMember.typeID, targetMember.typeID, visited) {
+				return false
+			}
+		}
+		return true
+	case btfKindFuncProto:
+		if len(localType.params) != len(targetType.params) ||
+			!coreTypesMatch(localBTF, targetBTF, localType.typeID, targetType.typeID, visited) {
+			return false
+		}
+		for i := range localType.params {
+			if !coreTypesMatch(localBTF, targetBTF, localType.params[i], targetType.params[i], visited) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func parseCoreAccess(access string) ([]uint32, error) {
@@ -1055,6 +1868,10 @@ func parseCoreAccess(access string) ([]uint32, error) {
 }
 
 func patchCoreFieldReloc(insns []byte, offset uint32, value uint32, order binary.ByteOrder) error {
+	return patchCoreReloc(insns, offset, uint64(value), order)
+}
+
+func patchCoreReloc(insns []byte, offset uint32, value uint64, order binary.ByteOrder) error {
 	if offset%8 != 0 {
 		return fmt.Errorf("CO-RE relocation offset %#x is not instruction aligned", offset)
 	}
@@ -1066,16 +1883,27 @@ func patchCoreFieldReloc(insns []byte, offset uint32, value uint32, order binary
 	switch insn[0] & bpfClassMask {
 	case bpfClassLDX, bpfClassST, bpfClassSTX:
 		if value > 32767 {
-			return fmt.Errorf("CO-RE field byte offset %d does not fit BPF instruction offset", value)
+			return fmt.Errorf("CO-RE value %d does not fit BPF instruction offset", value)
 		}
 		order.PutUint16(insn[2:4], uint16(value))
 	case bpfClassALU, bpfClassALU64:
 		if insn[0]&bpfSrcX != 0 {
 			return fmt.Errorf("CO-RE relocation at offset %#x targets register-source ALU instruction", offset)
 		}
-		order.PutUint32(insn[4:8], value)
+		low := uint32(value)
+		if value > 0x7fffffff && value != uint64(int64(int32(low))) {
+			return fmt.Errorf("CO-RE value %d does not fit signed BPF immediate", value)
+		}
+		order.PutUint32(insn[4:8], low)
 	case bpfClassLD:
-		return fmt.Errorf("CO-RE relocation at offset %#x targets unsupported load instruction", offset)
+		if insn[0] != 0x18 {
+			return fmt.Errorf("CO-RE relocation at offset %#x targets a non-64-bit immediate load", offset)
+		}
+		if uint64(offset)+16 > uint64(len(insns)) {
+			return fmt.Errorf("CO-RE 64-bit load at offset %#x is truncated", offset)
+		}
+		order.PutUint32(insn[4:8], uint32(value))
+		order.PutUint32(insns[offset+12:offset+16], uint32(value>>32))
 	default:
 		return fmt.Errorf("CO-RE relocation at offset %#x targets unsupported instruction class %#x", offset, insn[0]&bpfClassMask)
 	}
@@ -1106,6 +1934,7 @@ func createStructOpsMap(objBTF int, ops *structOpsInfo) (int, error) {
 		MapType:               bpfMapTypeOps,
 		KeySize:               4,
 		ValueSize:             ops.valueSize,
+		MapFlags:              bpfFLink,
 		MaxEntries:            1,
 		BtfFd:                 uint32(objBTF),
 		BtfVmlinuxValueTypeID: ops.valueTypeID,
@@ -1119,14 +1948,19 @@ func createStructOpsMap(objBTF int, ops *structOpsInfo) (int, error) {
 	return fd, nil
 }
 
-func (obj *bpfObject) structOpsValue(ops *structOpsInfo, programs map[string]int) ([]byte, error) {
+func (obj *bpfObject) structOpsValue(ops *structOpsInfo, targetBTF *btfSpec, programs map[string]int) ([]byte, error) {
 	value := make([]byte, ops.valueSize)
 	if ops.dataOffset > uint32(len(value)) {
 		return nil, errors.New("struct_ops data offset exceeds value size")
 	}
-	copy(value[ops.dataOffset:], obj.structOpsData)
-	order := nativeByteOrder()
+	if err := obj.copyStructOpsBytes(value, ops, targetBTF, "name"); err != nil {
+		return nil, err
+	}
+	if err := obj.copyStructOpsUint(value, ops, targetBTF, "flags"); err != nil {
+		return nil, err
+	}
 
+	order := nativeByteOrder()
 	for _, def := range brutalPrograms {
 		if def.memberName == "" {
 			continue
@@ -1140,50 +1974,210 @@ func (obj *bpfObject) structOpsValue(ops *structOpsInfo, programs map[string]int
 		if !ok {
 			return nil, fmt.Errorf("kernel tcp_congestion_ops is missing member %s", memberName)
 		}
+		size, err := targetBTF.sizeof(member.typeID)
+		if err != nil {
+			return nil, fmt.Errorf("size of tcp_congestion_ops.%s: %w", memberName, err)
+		}
+		if size != 8 {
+			return nil, fmt.Errorf("tcp_congestion_ops.%s has pointer size %d, want 8", memberName, size)
+		}
 		offset := ops.dataOffset + member.offset
-		if offset+8 > uint32(len(value)) {
+		if offset+size > uint32(len(value)) {
 			return nil, fmt.Errorf("member %s is outside struct_ops value", memberName)
 		}
-		order.PutUint64(value[offset:offset+8], uint64(fd))
+		order.PutUint64(value[offset:offset+size], uint64(fd))
 	}
 	return value, nil
 }
 
-func attachSetsockopt(progFD int, cgroupPath, pinPath string) error {
-	cgroupFD, err := syscall.Open(cgroupPath, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+func (obj *bpfObject) structOpsSourceField(name string) ([]byte, error) {
+	typeID, err := obj.btfSpec.varTypeID("brutal")
 	if err != nil {
-		return fmt.Errorf("open cgroup %s: %w", cgroupPath, err)
+		return nil, err
 	}
-	defer syscall.Close(cgroupFD)
-
-	if err := progAttach(cgroupFD, progFD, bpfAttachSetOpt, bpfFAllowMulti); err != nil {
-		return fmt.Errorf("attach cgroup setsockopt hook: %w", err)
+	typ := obj.btfSpec.resolveType(typeID)
+	if typ == nil || typ.kind != btfKindStruct {
+		return nil, errors.New("BTF var brutal is not a struct")
 	}
-
-	if err := objPin(progFD, pinPath); err != nil {
-		_ = progDetach(cgroupFD, progFD, bpfAttachSetOpt)
-		return fmt.Errorf("pin cgroup setsockopt program %s: %w", pinPath, err)
+	member := typ.member(name)
+	if member == nil {
+		return nil, fmt.Errorf("object tcp_congestion_ops is missing member %s", name)
 	}
+	if member.bitOffset%8 != 0 {
+		return nil, fmt.Errorf("object tcp_congestion_ops.%s is not byte aligned", name)
+	}
+	size, err := obj.btfSpec.sizeof(member.typeID)
+	if err != nil {
+		return nil, fmt.Errorf("size of object tcp_congestion_ops.%s: %w", name, err)
+	}
+	offset := member.bitOffset / 8
+	if offset+size > uint32(len(obj.structOpsData)) {
+		return nil, fmt.Errorf("object tcp_congestion_ops.%s is outside struct_ops data", name)
+	}
+	return obj.structOpsData[offset : offset+size], nil
+}
 
+func structOpsTargetField(value []byte, ops *structOpsInfo, targetBTF *btfSpec, name string) ([]byte, error) {
+	member, ok := ops.members[name]
+	if !ok {
+		return nil, fmt.Errorf("kernel tcp_congestion_ops is missing member %s", name)
+	}
+	size, err := targetBTF.sizeof(member.typeID)
+	if err != nil {
+		return nil, fmt.Errorf("size of kernel tcp_congestion_ops.%s: %w", name, err)
+	}
+	offset := ops.dataOffset + member.offset
+	if offset+size > uint32(len(value)) {
+		return nil, fmt.Errorf("kernel tcp_congestion_ops.%s is outside struct_ops value", name)
+	}
+	return value[offset : offset+size], nil
+}
+
+func (obj *bpfObject) copyStructOpsBytes(value []byte, ops *structOpsInfo, targetBTF *btfSpec, name string) error {
+	source, err := obj.structOpsSourceField(name)
+	if err != nil {
+		return err
+	}
+	target, err := structOpsTargetField(value, ops, targetBTF, name)
+	if err != nil {
+		return err
+	}
+	copy(target, source)
 	return nil
 }
 
-func unload(opts Options) error {
-	err := unloadSetsockopt(opts)
+func (obj *bpfObject) copyStructOpsUint(value []byte, ops *structOpsInfo, targetBTF *btfSpec, name string) error {
+	source, err := obj.structOpsSourceField(name)
+	if err != nil {
+		return err
+	}
+	n, err := decodeUint(source, obj.order)
+	if err != nil {
+		return fmt.Errorf("decode object tcp_congestion_ops.%s: %w", name, err)
+	}
+	target, err := structOpsTargetField(value, ops, targetBTF, name)
+	if err != nil {
+		return err
+	}
+	if err := encodeUint(target, n, nativeByteOrder()); err != nil {
+		return fmt.Errorf("encode kernel tcp_congestion_ops.%s: %w", name, err)
+	}
+	return nil
+}
 
-	if fd, getErr := objGet(structOpsPinPath); getErr == nil {
-		if unregErr := unregisterStructOps(fd); unregErr != nil && err == nil {
-			err = fmt.Errorf("unregister struct_ops map %s: %w", structOpsPinPath, unregErr)
+func decodeUint(data []byte, order binary.ByteOrder) (uint64, error) {
+	switch len(data) {
+	case 1:
+		return uint64(data[0]), nil
+	case 2:
+		return uint64(order.Uint16(data)), nil
+	case 4:
+		return uint64(order.Uint32(data)), nil
+	case 8:
+		return order.Uint64(data), nil
+	default:
+		return 0, fmt.Errorf("unsupported integer size %d", len(data))
+	}
+}
+
+func encodeUint(data []byte, value uint64, order binary.ByteOrder) error {
+	if len(data) < 8 {
+		bits := uint(len(data) * 8)
+		max := uint64(1)<<bits - 1
+		if value > max {
+			return fmt.Errorf("integer value %d does not fit %d bytes", value, len(data))
 		}
-		_ = syscall.Close(fd)
-	} else if !errors.Is(getErr, syscall.ENOENT) && err == nil {
-		err = fmt.Errorf("open pinned struct_ops map %s: %w", structOpsPinPath, getErr)
 	}
-	if unlinkErr := unlinkIfExists(structOpsPinPath); unlinkErr != nil && err == nil {
-		err = unlinkErr
+	switch len(data) {
+	case 1:
+		data[0] = byte(value)
+	case 2:
+		order.PutUint16(data, uint16(value))
+	case 4:
+		order.PutUint32(data, uint32(value))
+	case 8:
+		order.PutUint64(data, value)
+	default:
+		return fmt.Errorf("unsupported integer size %d", len(data))
 	}
+	return nil
+}
 
-	return err
+func attachSetsockopt(progFD int, cgroupPath string) (int, error) {
+	cgroupFD, err := syscall.Open(cgroupPath, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("open cgroup %s: %w", cgroupPath, err)
+	}
+	defer syscall.Close(cgroupFD)
+
+	fd, err := linkCreate(progFD, cgroupFD, bpfAttachSetOpt, 0)
+	if err != nil {
+		return -1, fmt.Errorf("attach cgroup setsockopt hook: %w", err)
+	}
+	return fd, nil
+}
+
+func unload(opts Options) error {
+	// Detach the policy hook first. If that fails, preserve struct_ops so the
+	// still-attached hook never points clients at an algorithm we removed.
+	if err := unloadSetsockopt(opts); err != nil {
+		return fmt.Errorf("remove setsockopt state: %w", err)
+	}
+	if err := unloadStructOps(); err != nil {
+		return fmt.Errorf("remove struct_ops state: %w", err)
+	}
+	return nil
+}
+
+func unloadStructOps() error {
+	fd, err := objGet(structOpsPinPath)
+	if errors.Is(err, syscall.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open pinned struct_ops object %s: %w", structOpsPinPath, err)
+	}
+	defer syscall.Close(fd)
+
+	kind, err := bpfObjectKind(fd)
+	if err != nil {
+		return fmt.Errorf("identify pinned struct_ops object %s: %w", structOpsPinPath, err)
+	}
+	switch kind {
+	case bpfFDLink:
+		linkInfo, err := getLinkInfo(fd)
+		if err != nil {
+			return fmt.Errorf("inspect pinned struct_ops link %s: %w", structOpsPinPath, err)
+		}
+		if err := validateStructOpsLinkInfo(linkInfo); err != nil {
+			return fmt.Errorf("refuse to detach unexpected link at %s: %w", structOpsPinPath, err)
+		}
+		return unlinkAndDetachLink(fd, structOpsPinPath)
+
+	case bpfFDMap:
+		mapInfo, err := getMapInfo(fd)
+		if err != nil {
+			return fmt.Errorf("inspect legacy struct_ops map %s: %w", structOpsPinPath, err)
+		}
+		if mapInfo.Type != bpfMapTypeOps || cString(mapInfo.Name[:]) != "brutal" || mapInfo.MapFlags&bpfFLink != 0 {
+			return fmt.Errorf("refuse to unregister unexpected map at %s (type %d, name %q, flags %#x)", structOpsPinPath, mapInfo.Type, cString(mapInfo.Name[:]), mapInfo.MapFlags)
+		}
+		if err := unregisterStructOps(fd); err != nil {
+			return fmt.Errorf("unregister legacy struct_ops map %s: %w", structOpsPinPath, err)
+		}
+		return unlinkIfExists(structOpsPinPath)
+
+	default:
+		return fmt.Errorf("pinned object %s is a %s, want a struct_ops link or legacy map", structOpsPinPath, kind)
+	}
+}
+
+func unlinkAndDetachLink(fd int, path string) error {
+	if err := linkDetach(fd); err != nil &&
+		!errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ENOLINK) {
+		return fmt.Errorf("detach BPF link %s: %w", path, err)
+	}
+	return unlinkIfExists(path)
 }
 
 func ensurePinRoot() error {
@@ -1210,14 +2204,40 @@ func ensurePinRoot() error {
 }
 
 func unloadSetsockopt(opts Options) error {
-	progFD, err := objGet(setsockoptPinPath)
+	fd, err := objGet(setsockoptPinPath)
 	if errors.Is(err, syscall.ENOENT) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("open pinned cgroup setsockopt program %s: %w", setsockoptPinPath, err)
+		return fmt.Errorf("open pinned cgroup setsockopt object %s: %w", setsockoptPinPath, err)
 	}
-	defer syscall.Close(progFD)
+	defer syscall.Close(fd)
+
+	kind, err := bpfObjectKind(fd)
+	if err != nil {
+		return fmt.Errorf("identify pinned cgroup setsockopt object %s: %w", setsockoptPinPath, err)
+	}
+	if kind == bpfFDLink {
+		linkInfo, err := getLinkInfo(fd)
+		if err != nil {
+			return fmt.Errorf("inspect pinned cgroup setsockopt link %s: %w", setsockoptPinPath, err)
+		}
+		if err := validateSetsockoptLinkInfo(linkInfo); err != nil {
+			return fmt.Errorf("refuse to detach unexpected link at %s: %w", setsockoptPinPath, err)
+		}
+		return unlinkAndDetachLink(fd, setsockoptPinPath)
+	}
+	if kind != bpfFDProgram {
+		return fmt.Errorf("pinned object %s is a %s, want a cgroup link or legacy program", setsockoptPinPath, kind)
+	}
+
+	progInfo, err := getProgInfo(fd)
+	if err != nil {
+		return fmt.Errorf("inspect legacy cgroup setsockopt program %s: %w", setsockoptPinPath, err)
+	}
+	if progInfo.Type != bpfProgCgrpOpt || cString(progInfo.Name[:]) != bpfKernelName("brutal_setsockopt") {
+		return fmt.Errorf("pinned object %s is neither a brutal cgroup link nor program", setsockoptPinPath)
+	}
 
 	cgroupFD, err := syscall.Open(opts.CgroupPath, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
@@ -1225,8 +2245,11 @@ func unloadSetsockopt(opts Options) error {
 	}
 	defer syscall.Close(cgroupFD)
 
-	if err := progDetach(cgroupFD, progFD, bpfAttachSetOpt); err != nil && !errors.Is(err, syscall.ENOENT) {
-		return fmt.Errorf("detach cgroup setsockopt hook: %w", err)
+	if err := progDetach(cgroupFD, fd, bpfAttachSetOpt); err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			return fmt.Errorf("legacy setsockopt program is not attached to cgroup %s; pin was preserved so it can be detached with the original CgroupPath", opts.CgroupPath)
+		}
+		return fmt.Errorf("detach legacy cgroup setsockopt hook: %w", err)
 	}
 
 	return unlinkIfExists(setsockoptPinPath)
@@ -1338,15 +2361,62 @@ func objGet(path string) (int, error) {
 	return fd, err
 }
 
-func progAttach(cgroupFD, progFD int, attachType, flags uint32) error {
-	attr := progAttachAttr{
-		TargetFd:    uint32(cgroupFD),
-		AttachBpfFd: uint32(progFD),
+func linkCreate(progOrMapFD, targetFD int, attachType, flags uint32) (int, error) {
+	attr := linkCreateAttr{
+		ProgOrMapFd: uint32(progOrMapFD),
+		TargetFd:    uint32(targetFD),
 		AttachType:  attachType,
-		AttachFlags: flags,
+		Flags:       flags,
 	}
-	_, err := bpf(bpfProgAttach, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+	return bpf(bpfLinkCreate, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+}
+
+func linkDetach(fd int) error {
+	attr := linkDetachAttr{LinkFd: uint32(fd)}
+	_, err := bpf(bpfLinkDetach, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
 	return err
+}
+
+func getFDInfo(fd int, info unsafe.Pointer, size uintptr) error {
+	attr := objInfoAttr{
+		BpfFd:   uint32(fd),
+		InfoLen: uint32(size),
+		Info:    uint64(uintptr(info)),
+	}
+	_, err := bpf(bpfObjGetInfo, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+	runtime.KeepAlive(info)
+	return err
+}
+
+func getLinkInfo(fd int) (bpfLinkInfo, error) {
+	var info bpfLinkInfo
+	err := getFDInfo(fd, unsafe.Pointer(&info), unsafe.Sizeof(info))
+	return info, err
+}
+
+func getProgInfo(fd int) (bpfProgInfo, error) {
+	var info bpfProgInfo
+	err := getFDInfo(fd, unsafe.Pointer(&info), unsafe.Sizeof(info))
+	return info, err
+}
+
+func getMapInfo(fd int) (bpfMapInfo, error) {
+	var info bpfMapInfo
+	err := getFDInfo(fd, unsafe.Pointer(&info), unsafe.Sizeof(info))
+	return info, err
+}
+
+func progGetFDByID(id uint32) (int, error) {
+	return getFDByID(bpfProgGetFD, id)
+}
+
+func mapGetFDByID(id uint32) (int, error) {
+	return getFDByID(bpfMapGetFD, id)
+}
+
+func getFDByID(command int, id uint32) (int, error) {
+	attr := idAttr{ID: id}
+	return bpf(command, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
 }
 
 func progDetach(cgroupFD, progFD int, attachType uint32) error {
@@ -1603,8 +2673,12 @@ type btfType struct {
 	size        uint32
 	typeID      uint32
 	intEncoding uint32
+	kindFlag    bool
+	array       *btfArray
 	members     []btfMember
+	enumValues  []btfEnumValue
 	paramCount  uint32
+	params      []uint32
 	varType     uint32
 }
 
@@ -1613,6 +2687,17 @@ type btfMember struct {
 	typeID       uint32
 	bitOffset    uint32
 	bitfieldSize uint32
+}
+
+type btfArray struct {
+	typeID      uint32
+	indexTypeID uint32
+	nelems      uint32
+}
+
+type btfEnumValue struct {
+	name  string
+	value uint64
 }
 
 type btfHeader struct {
@@ -1673,11 +2758,12 @@ func parseBTF(data []byte) (*btfSpec, error) {
 		kindFlag := info&btfKindFlag != 0
 		vlen := info & 0xffff
 		t := &btfType{
-			id:     id,
-			name:   spec.string(nameOff),
-			kind:   kind,
-			size:   sizeType,
-			typeID: sizeType,
+			id:       id,
+			name:     spec.string(nameOff),
+			kind:     kind,
+			size:     sizeType,
+			typeID:   sizeType,
+			kindFlag: kindFlag,
 		}
 
 		switch kind {
@@ -1689,6 +2775,14 @@ func parseBTF(data []byte) (*btfSpec, error) {
 			off += 4
 		case btfKindPtr, btfKindFwd, btfKindTypedef, btfKindVolatile, btfKindConst, btfKindRestrict, btfKindFunc, btfKindFloat, btfKindTypeTag:
 		case btfKindArray:
+			if off+12 > uint32(len(types)) {
+				return nil, fmt.Errorf("truncated BTF array info for %s", t.name)
+			}
+			t.array = &btfArray{
+				typeID:      order.Uint32(types[off : off+4]),
+				indexTypeID: order.Uint32(types[off+4 : off+8]),
+				nelems:      order.Uint32(types[off+8 : off+12]),
+			}
 			off += 12
 		case btfKindStruct, btfKindUnion:
 			t.members = make([]btfMember, 0, vlen)
@@ -1712,13 +2806,32 @@ func parseBTF(data []byte) (*btfSpec, error) {
 				off += 12
 			}
 		case btfKindEnum:
-			off += 8 * vlen
+			t.enumValues = make([]btfEnumValue, 0, vlen)
+			for i := uint32(0); i < vlen; i++ {
+				if off+8 > uint32(len(types)) {
+					return nil, fmt.Errorf("truncated BTF enum values for %s", t.name)
+				}
+				raw := order.Uint32(types[off+4 : off+8])
+				value := uint64(raw)
+				if kindFlag {
+					value = uint64(int64(int32(raw)))
+				}
+				t.enumValues = append(t.enumValues, btfEnumValue{
+					name:  spec.string(order.Uint32(types[off : off+4])),
+					value: value,
+				})
+				off += 8
+			}
 		case btfKindFuncProto:
 			if off+8*vlen > uint32(len(types)) {
 				return nil, fmt.Errorf("truncated BTF function prototype for %s", t.name)
 			}
 			t.paramCount = vlen
-			off += 8 * vlen
+			t.params = make([]uint32, 0, vlen)
+			for i := uint32(0); i < vlen; i++ {
+				t.params = append(t.params, order.Uint32(types[off+4:off+8]))
+				off += 8
+			}
 		case btfKindVar:
 			t.varType = sizeType
 			off += 4
@@ -1727,7 +2840,18 @@ func parseBTF(data []byte) (*btfSpec, error) {
 		case btfKindDeclTag:
 			off += 4
 		case btfKindEnum64:
-			off += 12 * vlen
+			t.enumValues = make([]btfEnumValue, 0, vlen)
+			for i := uint32(0); i < vlen; i++ {
+				if off+12 > uint32(len(types)) {
+					return nil, fmt.Errorf("truncated BTF enum64 values for %s", t.name)
+				}
+				t.enumValues = append(t.enumValues, btfEnumValue{
+					name: spec.string(order.Uint32(types[off : off+4])),
+					value: uint64(order.Uint32(types[off+4:off+8])) |
+						uint64(order.Uint32(types[off+8:off+12]))<<32,
+				})
+				off += 12
+			}
 		default:
 			return nil, fmt.Errorf("unsupported BTF kind %d", kind)
 		}
@@ -1757,6 +2881,72 @@ func (s *btfSpec) find(kind uint32, name string) *btfType {
 		}
 	}
 	return nil
+}
+
+func (s *btfSpec) findCoreTargetType(local *btfType) *btfType {
+	if local == nil {
+		return nil
+	}
+	name := coreEssentialName(local.name)
+	for _, typ := range s.types {
+		kindMatches := typ.kind == local.kind || isCoreEnumKind(typ.kind) && isCoreEnumKind(local.kind)
+		if kindMatches && coreEssentialName(typ.name) == name {
+			return typ
+		}
+	}
+	return nil
+}
+
+func (s *btfSpec) findCoreMember(root *btfType, name string) (btfMember, error) {
+	if name == "" {
+		return btfMember{}, errors.New("cannot search for an anonymous CO-RE member")
+	}
+	type candidate struct {
+		typ       *btfType
+		bitOffset uint32
+	}
+	queue := []candidate{{typ: root}}
+	visited := make(map[uint32]bool)
+	for len(queue) != 0 {
+		current := queue[0]
+		queue = queue[1:]
+		current.typ = s.resolveType(current.typ.id)
+		if current.typ == nil || (current.typ.kind != btfKindStruct && current.typ.kind != btfKindUnion) {
+			continue
+		}
+		if visited[current.typ.id] {
+			continue
+		}
+		visited[current.typ.id] = true
+		if len(visited) > 64 {
+			return btfMember{}, errors.New("CO-RE anonymous member nesting exceeds 64 types")
+		}
+		for _, member := range current.typ.members {
+			offset, err := addCoreBitOffset(current.bitOffset, member.bitOffset)
+			if err != nil {
+				return btfMember{}, err
+			}
+			if member.name == name {
+				member.bitOffset = offset
+				return member, nil
+			}
+			if member.name != "" {
+				continue
+			}
+			child := s.resolveType(member.typeID)
+			if child != nil && (child.kind == btfKindStruct || child.kind == btfKindUnion) {
+				queue = append(queue, candidate{typ: child, bitOffset: offset})
+			}
+		}
+	}
+	return btfMember{}, fmt.Errorf("%w: target type %q is missing member %q", errCoreTargetNotFound, root.name, name)
+}
+
+func coreEssentialName(name string) string {
+	if index := strings.LastIndex(name, "___"); index > 0 {
+		return name[:index]
+	}
+	return name
 }
 
 func (s *btfSpec) varTypeID(name string) (uint32, error) {
@@ -1809,8 +2999,21 @@ func (s *btfSpec) sizeof(typeID uint32) (uint32, error) {
 		return 0, fmt.Errorf("invalid type id %d", typeID)
 	}
 	switch typ.kind {
-	case btfKindInt, btfKindStruct, btfKindUnion, btfKindEnum, btfKindFloat:
+	case btfKindInt, btfKindStruct, btfKindUnion, btfKindEnum, btfKindEnum64, btfKindFloat:
 		return typ.size, nil
+	case btfKindArray:
+		if typ.array == nil {
+			return 0, fmt.Errorf("array type %d has no array metadata", typeID)
+		}
+		elementSize, err := s.sizeof(typ.array.typeID)
+		if err != nil {
+			return 0, err
+		}
+		size := uint64(elementSize) * uint64(typ.array.nelems)
+		if size > uint64(^uint32(0)) {
+			return 0, fmt.Errorf("array type %d size overflows uint32", typeID)
+		}
+		return uint32(size), nil
 	case btfKindPtr:
 		return 8, nil
 	case btfKindTypedef, btfKindVolatile, btfKindConst, btfKindRestrict, btfKindTypeTag:
@@ -1821,23 +3024,53 @@ func (s *btfSpec) sizeof(typeID uint32) (uint32, error) {
 }
 
 func (s *btfSpec) adjustCoreBitfield(field *coreField) error {
-	offset, err := s.coreBitfieldByteOffset(*field)
+	offset, loadSize, err := s.coreBitfieldLayout(*field)
 	if err != nil {
 		return err
 	}
 	field.bitfieldOffset = field.bitOffset - offset*8
+	field.loadSize = loadSize
 	return nil
 }
 
 func (s *btfSpec) coreBitfieldByteOffset(field coreField) (uint32, error) {
-	align, err := s.alignof(field.typeID)
+	offset, _, err := s.coreBitfieldLayout(field)
+	return offset, err
+}
+
+func (s *btfSpec) coreBitfieldLayout(field coreField) (uint32, uint32, error) {
+	loadSize, err := s.sizeof(field.typeID)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	if align == 0 {
-		return 0, errors.New("zero field alignment")
+	if loadSize == 0 {
+		return 0, 0, errors.New("zero-sized bitfield container")
 	}
-	return (field.bitOffset / 8 / align) * align, nil
+	if loadSize&(loadSize-1) != 0 {
+		normalized := uint32(1)
+		for normalized < loadSize {
+			if normalized == 8 {
+				return 0, 0, fmt.Errorf("bitfield container size %d exceeds BPF load width", loadSize)
+			}
+			normalized <<= 1
+		}
+		loadSize = normalized
+	}
+	if loadSize > 8 {
+		return 0, 0, fmt.Errorf("bitfield container size %d exceeds BPF load width", loadSize)
+	}
+
+	end := uint64(field.bitOffset) + uint64(field.bitfieldSize)
+	for {
+		offset := field.bitOffset / 8 / loadSize * loadSize
+		if end <= (uint64(offset)+uint64(loadSize))*8 {
+			return offset, loadSize, nil
+		}
+		if loadSize == 8 {
+			return 0, 0, fmt.Errorf("bitfield at bit %d with size %d cannot be loaded atomically", field.bitOffset, field.bitfieldSize)
+		}
+		loadSize <<= 1
+	}
 }
 
 func (s *btfSpec) coreFieldBitSize(field coreField) (uint32, error) {
@@ -1856,6 +3089,12 @@ func (s *btfSpec) coreFieldSigned(typeID uint32) (uint32, error) {
 	if typ == nil {
 		return 0, fmt.Errorf("invalid type id %d", typeID)
 	}
+	if typ.kind == btfKindEnum || typ.kind == btfKindEnum64 {
+		if typ.kindFlag {
+			return 1, nil
+		}
+		return 0, nil
+	}
 	if typ.kind != btfKindInt {
 		return 0, fmt.Errorf("type %q has no integer signedness", typ.name)
 	}
@@ -1863,31 +3102,6 @@ func (s *btfSpec) coreFieldSigned(typeID uint32) (uint32, error) {
 		return 1, nil
 	}
 	return 0, nil
-}
-
-func (s *btfSpec) alignof(typeID uint32) (uint32, error) {
-	typ := s.resolveType(typeID)
-	if typ == nil {
-		return 0, fmt.Errorf("invalid type id %d", typeID)
-	}
-	switch typ.kind {
-	case btfKindInt, btfKindEnum, btfKindPtr:
-		return s.sizeof(typ.id)
-	case btfKindStruct, btfKindUnion:
-		var align uint32 = 1
-		for _, member := range typ.members {
-			memberAlign, err := s.alignof(member.typeID)
-			if err != nil {
-				return 0, err
-			}
-			if memberAlign > align {
-				align = memberAlign
-			}
-		}
-		return align, nil
-	default:
-		return 0, fmt.Errorf("unsupported alignof kind %d for %s", typ.kind, typ.name)
-	}
 }
 
 func (s *btfSpec) structOpsInfo(innerName string) (*structOpsInfo, error) {
@@ -1909,11 +3123,24 @@ func (s *btfSpec) structOpsInfo(innerName string) (*structOpsInfo, error) {
 	if data == nil {
 		return nil, fmt.Errorf("kernel BTF struct %s is missing data member", wrapperName)
 	}
+	if data.bitOffset%8 != 0 {
+		return nil, fmt.Errorf("kernel BTF struct %s data member is not byte aligned", wrapperName)
+	}
+	dataType := s.resolveType(data.typeID)
+	if dataType == nil || dataType.kind != btfKindStruct || dataType.id != inner.id {
+		return nil, fmt.Errorf("kernel BTF struct %s data member is not struct %s", wrapperName, innerName)
+	}
+	if data.bitOffset/8+inner.size > wrapper.size {
+		return nil, fmt.Errorf("kernel BTF struct %s data member exceeds wrapper size", wrapperName)
+	}
 	info.valueTypeID = wrapper.id
 	info.valueSize = wrapper.size
 	info.dataOffset = data.bitOffset / 8
 
 	for i, member := range inner.members {
+		if member.bitOffset%8 != 0 || member.bitfieldSize != 0 {
+			return nil, fmt.Errorf("kernel tcp_congestion_ops.%s is not a byte-aligned regular field", member.name)
+		}
 		info.members[member.name] = structOpsMember{
 			index:  uint32(i),
 			offset: member.bitOffset / 8,
@@ -1947,7 +3174,7 @@ func (s *btfSpec) funcProto(typeID uint32) *btfType {
 }
 
 func (s *btfSpec) resolveType(typeID uint32) *btfType {
-	for {
+	for depth := 0; depth < 64; depth++ {
 		typ := s.typeByID(typeID)
 		if typ == nil {
 			return nil
@@ -1959,6 +3186,7 @@ func (s *btfSpec) resolveType(typeID uint32) *btfType {
 			return typ
 		}
 	}
+	return nil
 }
 
 func (t *btfType) member(name string) *btfMember {
@@ -1966,16 +3194,6 @@ func (t *btfType) member(name string) *btfMember {
 		if t.members[i].name == name {
 			return &t.members[i]
 		}
-	}
-	return nil
-}
-
-func (t *btfType) matchCoreMember(name string, fallbackIndex uint32) *btfMember {
-	if name != "" {
-		return t.member(name)
-	}
-	if fallbackIndex < uint32(len(t.members)) {
-		return &t.members[fallbackIndex]
 	}
 	return nil
 }
